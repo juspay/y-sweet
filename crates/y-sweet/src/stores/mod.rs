@@ -1,11 +1,52 @@
 pub mod filesystem;
 pub mod gcs;
 pub mod s3;
+pub mod storage_keys;
+
+use gcs::GcsOptions;
+use std::sync::Arc;
+use storage_keys::StorageKeyProvider;
+
+/// Builds GCS store options from the encryption-related settings. Fails if
+/// encryption is requested without the backend URL and server token needed
+/// to fetch keys, so Y-Sweet never starts up writing docs unencrypted.
+pub fn gcs_options(
+    store_encryption: bool,
+    gcs_endpoint: Option<&str>,
+    backend_url: Option<&str>,
+    server_token: Option<&str>,
+) -> anyhow::Result<GcsOptions> {
+    let endpoint = gcs_endpoint.filter(|e| !e.is_empty()).map(str::to_owned);
+    let key_provider = if store_encryption {
+        let backend_url = backend_url.filter(|u| !u.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_BACKEND_URL to be set")
+        })?;
+        let server_token = server_token.filter(|t| !t.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_SERVER_TOKEN to be set")
+        })?;
+        Some(Arc::new(StorageKeyProvider::new(
+            backend_url,
+            server_token.to_owned(),
+        )?))
+    } else {
+        None
+    };
+    Ok(GcsOptions {
+        endpoint,
+        key_provider,
+    })
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StoreTarget {
-    S3 { bucket: String, prefix: Option<String> },
-    Gcs { bucket: String, prefix: Option<String> },
+    S3 {
+        bucket: String,
+        prefix: Option<String>,
+    },
+    Gcs {
+        bucket: String,
+        prefix: Option<String>,
+    },
     Filesystem(String),
 }
 
@@ -36,12 +77,20 @@ pub fn target_from_bucket_env(bucket: &str, prefix: Option<String>) -> anyhow::R
     if bucket.starts_with("s3://") || bucket.starts_with("gs://") {
         let target = parse_store_target(bucket)?;
         match (target, prefix) {
-            (StoreTarget::S3 { bucket, prefix: None }, p) => {
-                Ok(StoreTarget::S3 { bucket, prefix: p })
-            }
-            (StoreTarget::Gcs { bucket, prefix: None }, p) => {
-                Ok(StoreTarget::Gcs { bucket, prefix: p })
-            }
+            (
+                StoreTarget::S3 {
+                    bucket,
+                    prefix: None,
+                },
+                p,
+            ) => Ok(StoreTarget::S3 { bucket, prefix: p }),
+            (
+                StoreTarget::Gcs {
+                    bucket,
+                    prefix: None,
+                },
+                p,
+            ) => Ok(StoreTarget::Gcs { bucket, prefix: p }),
             _ => anyhow::bail!(
                 "STORAGE_BUCKET must not contain a path when used with STORAGE_PREFIX: {}",
                 bucket
@@ -109,6 +158,24 @@ mod tests {
     fn bucket_env_s3_scheme_is_s3() {
         let t = target_from_bucket_env("s3://my-bucket", None).unwrap();
         assert!(matches!(t, StoreTarget::S3 { ref bucket, .. } if bucket == "my-bucket"));
+    }
+
+    #[test]
+    fn encryption_requires_backend_url_and_token() {
+        assert!(gcs_options(true, None, None, Some("t")).is_err());
+        assert!(gcs_options(true, None, Some("http://b"), None).is_err());
+        assert!(gcs_options(true, None, Some(""), Some("t")).is_err());
+        assert!(gcs_options(true, None, Some("http://b"), Some("")).is_err());
+        let opts = gcs_options(true, Some("http://proxy"), Some("http://b"), Some("t")).unwrap();
+        assert!(opts.key_provider.is_some());
+        assert_eq!(opts.endpoint.as_deref(), Some("http://proxy"));
+    }
+
+    #[test]
+    fn encryption_off_needs_no_backend() {
+        let opts = gcs_options(false, Some(""), None, None).unwrap();
+        assert!(opts.key_provider.is_none());
+        assert!(opts.endpoint.is_none());
     }
 
     #[test]

@@ -13,10 +13,14 @@ use storage_keys::StorageKeyProvider;
 pub fn gcs_options(
     store_encryption: bool,
     gcs_endpoint: Option<&str>,
+    gcs_control_endpoint: Option<&str>,
     backend_url: Option<&str>,
     server_token: Option<&str>,
 ) -> anyhow::Result<GcsOptions> {
     let endpoint = gcs_endpoint.filter(|e| !e.is_empty()).map(str::to_owned);
+    let control_endpoint = gcs_control_endpoint
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned);
     let key_provider = if store_encryption {
         let backend_url = backend_url.filter(|u| !u.is_empty()).ok_or_else(|| {
             anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_BACKEND_URL to be set")
@@ -33,6 +37,7 @@ pub fn gcs_options(
     };
     Ok(GcsOptions {
         endpoint,
+        control_endpoint,
         key_provider,
     })
 }
@@ -162,20 +167,29 @@ mod tests {
 
     #[test]
     fn encryption_requires_backend_url_and_token() {
-        assert!(gcs_options(true, None, None, Some("t")).is_err());
-        assert!(gcs_options(true, None, Some("http://b"), None).is_err());
-        assert!(gcs_options(true, None, Some(""), Some("t")).is_err());
-        assert!(gcs_options(true, None, Some("http://b"), Some("")).is_err());
-        let opts = gcs_options(true, Some("http://proxy"), Some("http://b"), Some("t")).unwrap();
+        assert!(gcs_options(true, None, None, None, Some("t")).is_err());
+        assert!(gcs_options(true, None, None, Some("http://b"), None).is_err());
+        assert!(gcs_options(true, None, None, Some(""), Some("t")).is_err());
+        assert!(gcs_options(true, None, None, Some("http://b"), Some("")).is_err());
+        let opts = gcs_options(
+            true,
+            Some("http://proxy"),
+            Some("http://proxy-grpc"),
+            Some("http://b"),
+            Some("t"),
+        )
+        .unwrap();
         assert!(opts.key_provider.is_some());
         assert_eq!(opts.endpoint.as_deref(), Some("http://proxy"));
+        assert_eq!(opts.control_endpoint.as_deref(), Some("http://proxy-grpc"));
     }
 
     #[test]
     fn encryption_off_needs_no_backend() {
-        let opts = gcs_options(false, Some(""), None, None).unwrap();
+        let opts = gcs_options(false, Some(""), Some(""), None, None).unwrap();
         assert!(opts.key_provider.is_none());
         assert!(opts.endpoint.is_none());
+        assert!(opts.control_endpoint.is_none());
     }
 
     #[test]

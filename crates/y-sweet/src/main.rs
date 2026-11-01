@@ -30,9 +30,15 @@ struct GcsArgs {
     #[clap(long, default_value = "false", env = "Y_SWEET_STORE_ENCRYPTION")]
     store_encryption: bool,
 
-    /// Override the GCS endpoint (e.g. the CSEK enforcement proxy).
+    /// Override the GCS JSON API endpoint used for object reads and writes
+    /// (e.g. the CSEK enforcement proxy).
     #[clap(long, env = "Y_SWEET_GCS_ENDPOINT")]
     gcs_endpoint: Option<String>,
+
+    /// Override the GCS gRPC endpoint used for bucket and object metadata,
+    /// and deletes. Unset, these go to GCS directly.
+    #[clap(long, env = "Y_SWEET_GCS_CONTROL_ENDPOINT")]
+    gcs_control_endpoint: Option<String>,
 }
 
 impl GcsArgs {
@@ -40,6 +46,7 @@ impl GcsArgs {
         gcs_options(
             self.store_encryption,
             self.gcs_endpoint.as_deref(),
+            self.gcs_control_endpoint.as_deref(),
             backend_url,
             server_token,
         )

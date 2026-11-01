@@ -22,34 +22,18 @@ use y_sweet_core::{auth::Authenticator, store::Store};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Settings for GCS-backed stores: CSEK encryption and endpoint override.
+/// Settings for GCS-backed stores.
 #[derive(clap::Args)]
 struct GcsArgs {
     /// Encrypt each doc with a per-doc customer-supplied key (CSEK) issued by
     /// the backend. Requires Y_SWEET_BACKEND_URL and Y_SWEET_SERVER_TOKEN.
     #[clap(long, default_value = "false", env = "Y_SWEET_STORE_ENCRYPTION")]
     store_encryption: bool,
-
-    /// Override the GCS JSON API endpoint used for object reads and writes
-    /// (e.g. the CSEK enforcement proxy).
-    #[clap(long, env = "Y_SWEET_GCS_ENDPOINT")]
-    gcs_endpoint: Option<String>,
-
-    /// Override the GCS gRPC endpoint used for bucket and object metadata,
-    /// and deletes. Unset, these go to GCS directly.
-    #[clap(long, env = "Y_SWEET_GCS_CONTROL_ENDPOINT")]
-    gcs_control_endpoint: Option<String>,
 }
 
 impl GcsArgs {
     fn options(&self, backend_url: Option<&str>, server_token: Option<&str>) -> Result<GcsOptions> {
-        gcs_options(
-            self.store_encryption,
-            self.gcs_endpoint.as_deref(),
-            self.gcs_control_endpoint.as_deref(),
-            backend_url,
-            server_token,
-        )
+        gcs_options(self.store_encryption, backend_url, server_token)
     }
 }
 

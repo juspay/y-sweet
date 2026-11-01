@@ -74,11 +74,6 @@ fn encryption_error(op: &str, doc_id: &str, err: impl std::fmt::Display) -> Stor
 
 #[derive(Clone, Default)]
 pub struct GcsOptions {
-    /// Overrides the JSON API endpoint for object reads and writes
-    /// (e.g. the CSEK enforcement proxy).
-    pub endpoint: Option<String>,
-    /// Overrides the gRPC endpoint for metadata and deletes.
-    pub control_endpoint: Option<String>,
     /// When set, every doc is encrypted with a per-doc CSEK.
     pub key_provider: Option<Arc<StorageKeyProvider>>,
 }
@@ -109,14 +104,8 @@ impl GcsStore {
         prefix: Option<String>,
         options: GcsOptions,
     ) -> anyhow::Result<Self> {
-        let mut storage = Storage::builder();
-        let mut control = StorageControl::builder();
-        if let Some(endpoint) = &options.endpoint {
-            storage = storage.with_endpoint(endpoint);
-        }
-        if let Some(endpoint) = &options.control_endpoint {
-            control = control.with_endpoint(endpoint);
-        }
+        let storage = Storage::builder().build().await?;
+        let control = StorageControl::builder().build().await?;
         let encryption = options.key_provider.map(|provider| Encryption {
             provider,
             keys: Cache::builder()
@@ -125,8 +114,8 @@ impl GcsStore {
                 .build(),
         });
         Ok(GcsStore {
-            storage: storage.build().await?,
-            control: control.build().await?,
+            storage,
+            control,
             bucket,
             prefix,
             bucket_checked: OnceLock::new(),

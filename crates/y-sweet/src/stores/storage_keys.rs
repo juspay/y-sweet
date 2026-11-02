@@ -1,7 +1,7 @@
 //! Per-doc customer-supplied encryption keys (CSEK), issued by the backend.
 //!
 //! Y-Sweet never talks to the encryption service directly. It asks the
-//! backend's `POST /api/ysweet/storage-key` (server-token auth) either to
+//! backend's `POST /internal/ysweet/storage-key` (server-token auth) either to
 //! generate a fresh key for a doc, or to unwrap a key stored in the object's
 //! metadata. Key material must never be logged.
 
@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
 use std::time::Duration;
 
-const STORAGE_KEY_PATH: &str = "/api/ysweet/storage-key";
+const STORAGE_KEY_PATH: &str = "/internal/ysweet/storage-key";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A doc's plaintext CSEK together with its wrapped form (`enc-wdek`).
@@ -163,6 +163,6 @@ mod tests {
     #[test]
     fn url_joins_without_double_slash() {
         let p = StorageKeyProvider::new("http://backend:3000/", "t".to_string()).unwrap();
-        assert_eq!(p.url, "http://backend:3000/api/ysweet/storage-key");
+        assert_eq!(p.url, "http://backend:3000/internal/ysweet/storage-key");
     }
 }

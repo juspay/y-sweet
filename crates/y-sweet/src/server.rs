@@ -4,7 +4,7 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket},
-        DefaultBodyLimit, Path, Query, Request, State, WebSocketUpgrade,
+        DefaultBodyLimit, Extension, Path, Query, Request, State, WebSocketUpgrade,
     },
     http::{
         header::{HeaderMap, HeaderName},
@@ -16,8 +16,10 @@ use axum::{
     Json, Router,
 };
 use axum_extra::typed_header::TypedHeader;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use dashmap::{mapref::one::MappedRef, DashMap};
 use futures::{SinkExt, StreamExt};
+use moka::{future::Cache, policy::EvictionPolicy};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
@@ -65,6 +67,23 @@ const CONNECT_VALIDATE_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_millis(500),
     Duration::from_secs(1),
 ];
+
+// `~` is outside the base64url and key-id alphabets, so a signed token never starts with this.
+const TICKET_PREFIX: &str = "tkt~";
+const TICKET_TTL: Duration = Duration::from_secs(30);
+const TICKET_MAX_CAPACITY: u64 = 100_000;
+
+#[derive(Clone)]
+struct Ticket {
+    doc_id: String,
+    user_id: String,
+    authorization: Authorization,
+    // moka's `remove` still returns entries past their TTL until they are evicted.
+    expires_at: std::time::Instant,
+}
+
+#[derive(Clone)]
+struct VerifiedIdentity(Authorization, Option<String>);
 
 fn current_time_epoch_millis() -> u64 {
     let now = std::time::SystemTime::now();
@@ -132,6 +151,7 @@ pub struct Server {
     validate_poll_every: Duration,
     validate_retry_attempts: u32,
     validate_retry_delay: Duration,
+    tickets: Cache<String, Ticket>,
 }
 
 impl Server {
@@ -185,6 +205,13 @@ impl Server {
             validate_poll_every,
             validate_retry_attempts,
             validate_retry_delay,
+            // moka's default TinyLFU can refuse a new insert when full, so the ticket we hand out
+            // would not exist. LRU always stores it and evicts the oldest instead.
+            tickets: Cache::builder()
+                .time_to_live(TICKET_TTL)
+                .max_capacity(TICKET_MAX_CAPACITY)
+                .eviction_policy(EvictionPolicy::lru())
+                .build(),
         })
     }
 
@@ -598,6 +625,56 @@ impl Server {
         }
     }
 
+    async fn issue_ticket(
+        &self,
+        doc_id: &str,
+        user_id: String,
+        authorization: Authorization,
+    ) -> Result<String> {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes)?;
+        let ticket = format!("{TICKET_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes));
+        self.tickets
+            .insert(
+                ticket.clone(),
+                Ticket {
+                    doc_id: doc_id.to_string(),
+                    user_id,
+                    authorization,
+                    expires_at: std::time::Instant::now() + TICKET_TTL,
+                },
+            )
+            .await;
+        Ok(ticket)
+    }
+
+    /// Resolves a signed token or a single-use ticket. Tickets are only valid for WebSocket upgrades.
+    async fn verify_token_or_ticket(
+        &self,
+        token: &str,
+        doc_id: &str,
+        websocket: bool,
+    ) -> Result<(Authorization, Option<String>), AppError> {
+        if !token.starts_with(TICKET_PREFIX) {
+            return self.verify_doc_token(Some(token), doc_id);
+        }
+        if !websocket {
+            return Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("Tickets are only valid for WebSocket connections"),
+            ));
+        }
+        match self.tickets.remove(token).await {
+            Some(t) if t.doc_id == doc_id && std::time::Instant::now() < t.expires_at => {
+                Ok((t.authorization, Some(t.user_id)))
+            }
+            _ => Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("Invalid or used ticket"),
+            )),
+        }
+    }
+
     fn get_single_doc_id(&self) -> Result<String, AppError> {
         self.docs
             .iter()
@@ -763,6 +840,7 @@ async fn handle_socket_upgrade_full_path(
     Path((doc_id, doc_id2)): Path<(String, String)>,
     Query(params): Query<HandlerParams>,
     State(server_state): State<Arc<Server>>,
+    identity: Option<Extension<VerifiedIdentity>>,
 ) -> Result<Response, AppError> {
     if doc_id != doc_id2 {
         return Err(AppError(
@@ -770,7 +848,11 @@ async fn handle_socket_upgrade_full_path(
             anyhow!("For Yjs compatibility, the doc_id appears twice in the URL. It must be the same in both places, but we got {} and {}.", doc_id, doc_id2),
         ));
     }
-    let (authorization, user_id) = server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
+    // A ticket is gone once the middleware consumes it, so reuse the middleware's result.
+    let (authorization, user_id) = match identity {
+        Some(Extension(VerifiedIdentity(authorization, user_id))) => (authorization, user_id),
+        None => server_state.verify_doc_token(params.token.as_deref(), &doc_id)?,
+    };
     handle_socket_upgrade(ws, Path(doc_id), authorization, user_id, State(server_state)).await
 }
 
@@ -1009,6 +1091,7 @@ async fn auth_doc(
         authorization,
         user_id,
         valid_for_seconds,
+        ticket,
     }) = body.unwrap_or_default();
 
     let Some(user_id) = user_id else {
@@ -1023,10 +1106,18 @@ async fn auth_doc(
     let expiration_time =
         ExpirationTimeEpochMillis(current_time_epoch_millis() + valid_for_seconds * 1000);
 
-    let token = server_state
-        .authenticator
-        .as_ref()
-        .map(|auth| auth.gen_doc_token(&doc_id, Some(user_id), authorization, expiration_time));
+    let token = match &server_state.authenticator {
+        None => None,
+        Some(_) if ticket => Some(
+            server_state
+                .issue_ticket(&doc_id, user_id, authorization)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
+        ),
+        Some(auth) => {
+            Some(auth.gen_doc_token(&doc_id, Some(user_id), authorization, expiration_time))
+        }
+    };
 
     let url = if let Some(url_prefix) = &server_state.url_prefix {
         let mut url_prefix = url_prefix.clone();
@@ -1069,7 +1160,7 @@ async fn auth_doc(
 async fn validate_user_middleware(
     State(server_state): State<Arc<Server>>,
     Path(params): Path<HashMap<String, String>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Result<Response, AppError> {
     if server_state.authenticator.is_none() {
@@ -1084,7 +1175,13 @@ async fn validate_user_middleware(
     let token = extract_request_token(&req)
         .ok_or_else(|| AppError(StatusCode::FORBIDDEN, anyhow!("Missing token")))?;
 
-    let (authorization, user_id) = server_state.verify_doc_token(Some(&token), &doc_id)?;
+    // Only `/d/:doc_id/ws/:doc_id2` has a second doc id.
+    let websocket = params.contains_key("doc_id2");
+    let (authorization, user_id) = server_state
+        .verify_token_or_ticket(&token, &doc_id, websocket)
+        .await?;
+    req.extensions_mut()
+        .insert(VerifiedIdentity(authorization, user_id.clone()));
 
     let Some(user_id) = user_id else {
         return Err(AppError(
@@ -1160,6 +1257,11 @@ mod test {
             true,
             None,
             false,
+            None,
+            None,
+            DEFAULT_VALIDATE_POLL_EVERY,
+            DEFAULT_VALIDATE_RETRY_ATTEMPTS,
+            DEFAULT_VALIDATE_RETRY_DELAY,
         )
         .await
         .unwrap();
@@ -1175,8 +1277,9 @@ mod test {
             Path(doc_id.clone()),
             Some(Json(AuthDocRequest {
                 authorization: Authorization::Full,
-                user_id: None,
+                user_id: Some("u1".to_string()),
                 valid_for_seconds: None,
+                ticket: false,
             })),
         )
         .await
@@ -1201,6 +1304,11 @@ mod test {
             true,
             None,
             false,
+            None,
+            None,
+            DEFAULT_VALIDATE_POLL_EVERY,
+            DEFAULT_VALIDATE_RETRY_ATTEMPTS,
+            DEFAULT_VALIDATE_RETRY_DELAY,
         )
         .await
         .unwrap();
@@ -1214,7 +1322,10 @@ mod test {
             ))),
             State(Arc::new(server_state)),
             Path(doc_id.clone()),
-            None,
+            Some(Json(AuthDocRequest {
+                user_id: Some("u1".to_string()),
+                ..Default::default()
+            })),
         )
         .await
         .unwrap();
@@ -1238,6 +1349,11 @@ mod test {
             true,
             None,
             false,
+            None,
+            None,
+            DEFAULT_VALIDATE_POLL_EVERY,
+            DEFAULT_VALIDATE_RETRY_ATTEMPTS,
+            DEFAULT_VALIDATE_RETRY_DELAY,
         )
         .await
         .unwrap();
@@ -1251,7 +1367,10 @@ mod test {
             ))),
             State(Arc::new(server_state)),
             Path(doc_id.clone()),
-            None,
+            Some(Json(AuthDocRequest {
+                user_id: Some("u1".to_string()),
+                ..Default::default()
+            })),
         )
         .await
         .unwrap();
@@ -1288,6 +1407,11 @@ mod test {
                 true,
                 None,
                 false,
+                None,
+                None,
+                DEFAULT_VALIDATE_POLL_EVERY,
+                DEFAULT_VALIDATE_RETRY_ATTEMPTS,
+                DEFAULT_VALIDATE_RETRY_DELAY,
             )
             .await
             .unwrap();
@@ -1307,9 +1431,137 @@ mod test {
             true,
             None,
             false,
+            None,
+            None,
+            DEFAULT_VALIDATE_POLL_EVERY,
+            DEFAULT_VALIDATE_RETRY_ATTEMPTS,
+            DEFAULT_VALIDATE_RETRY_DELAY,
         )
         .await
         .unwrap();
         assert_eq!(server.path_prefix.as_deref(), Some("/ysweet"));
+    }
+
+    async fn ticket_server() -> (Arc<Server>, String) {
+        let server = Server::new(
+            None,
+            Duration::from_secs(60),
+            Some(Authenticator::gen_key().unwrap()),
+            None,
+            None,
+            CancellationToken::new(),
+            true,
+            None,
+            false,
+            None,
+            None,
+            DEFAULT_VALIDATE_POLL_EVERY,
+            DEFAULT_VALIDATE_RETRY_ATTEMPTS,
+            DEFAULT_VALIDATE_RETRY_DELAY,
+        )
+        .await
+        .unwrap();
+        let doc_id = server.create_doc().await.unwrap();
+        (Arc::new(server), doc_id)
+    }
+
+    async fn request_token(server: &Arc<Server>, doc_id: &str, ticket: bool) -> String {
+        let server_token = server.authenticator.as_ref().unwrap().server_token();
+        auth_doc(
+            Some(TypedHeader(
+                headers::Authorization::bearer(&server_token).unwrap(),
+            )),
+            TypedHeader(headers::Host::from(http::uri::Authority::from_static(
+                "localhost",
+            ))),
+            State(server.clone()),
+            Path(doc_id.to_string()),
+            Some(Json(AuthDocRequest {
+                authorization: Authorization::ReadOnly,
+                user_id: Some("u1".to_string()),
+                valid_for_seconds: None,
+                ticket,
+            })),
+        )
+        .await
+        .unwrap()
+        .0
+        .token
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_ticket_is_single_use() {
+        let (server, doc_id) = ticket_server().await;
+        let ticket = request_token(&server, &doc_id, true).await;
+        assert!(ticket.starts_with(TICKET_PREFIX));
+
+        let (authorization, user_id) = server
+            .verify_token_or_ticket(&ticket, &doc_id, true)
+            .await
+            .unwrap();
+        assert!(authorization == Authorization::ReadOnly);
+        assert_eq!(user_id.as_deref(), Some("u1"));
+
+        let err = server
+            .verify_token_or_ticket(&ticket, &doc_id, true)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_expired_ticket_rejected() {
+        let (server, doc_id) = ticket_server().await;
+        let ticket = request_token(&server, &doc_id, true).await;
+        let mut entry = server.tickets.get(&ticket).await.unwrap();
+        entry.expires_at = std::time::Instant::now() - Duration::from_millis(1);
+        server.tickets.insert(ticket.clone(), entry).await;
+
+        let err = server
+            .verify_token_or_ticket(&ticket, &doc_id, true)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_ticket_doc_mismatch_rejected() {
+        let (server, doc_id) = ticket_server().await;
+        let ticket = request_token(&server, &doc_id, true).await;
+        let err = server
+            .verify_token_or_ticket(&ticket, "other-doc", true)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_ticket_rejected_outside_websocket() {
+        let (server, doc_id) = ticket_server().await;
+        let ticket = request_token(&server, &doc_id, true).await;
+        let err = server
+            .verify_token_or_ticket(&ticket, &doc_id, false)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_signed_token_still_accepted() {
+        let (server, doc_id) = ticket_server().await;
+        let token = request_token(&server, &doc_id, false).await;
+        assert!(!token.starts_with(TICKET_PREFIX));
+        for websocket in [true, false, true] {
+            let (_, user_id) = server
+                .verify_token_or_ticket(&token, &doc_id, websocket)
+                .await
+                .unwrap();
+            assert_eq!(user_id.as_deref(), Some("u1"));
+        }
     }
 }

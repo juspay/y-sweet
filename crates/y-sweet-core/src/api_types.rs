@@ -28,6 +28,9 @@ pub struct AuthDocRequest {
     pub user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "validForSeconds")]
     pub valid_for_seconds: Option<u64>,
+    /// Return a single-use WebSocket ticket instead of a signed token.
+    #[serde(default)]
+    pub ticket: bool,
 }
 
 impl Default for AuthDocRequest {
@@ -36,6 +39,7 @@ impl Default for AuthDocRequest {
             authorization: Authorization::Full,
             user_id: None,
             valid_for_seconds: None,
+            ticket: false,
         }
     }
 }
@@ -82,4 +86,18 @@ pub fn validate_doc_name(doc_name: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_auth_doc_request_without_ticket() {
+        let req: AuthDocRequest =
+            serde_json::from_str(r#"{"userId":"u1","validForSeconds":60}"#).unwrap();
+        assert!(!req.ticket);
+        let req: AuthDocRequest = serde_json::from_str(r#"{"userId":"u1","ticket":true}"#).unwrap();
+        assert!(req.ticket);
+    }
 }

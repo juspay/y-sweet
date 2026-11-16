@@ -23,6 +23,7 @@ clap = { version = "4.3.12", features = ["derive", "env"] }
 colored = "2.0.4"
 dashmap = "6.0.1"
 futures = "0.3.28"
+getrandom = "0.2"
 headers = "0.4.0"
 lib0 = "0.16.9"
 moka = { version = "0.12", features = ["future"] }

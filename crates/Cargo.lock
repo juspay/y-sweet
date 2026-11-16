@@ -4466,6 +4466,7 @@ dependencies = [
  "colored",
  "dashmap",
  "futures",
+ "getrandom 0.2.15",
  "google-cloud-gax",
  "google-cloud-storage",
  "headers",

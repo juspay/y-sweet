@@ -275,6 +275,7 @@ async fn auth_doc(
         authorization: body.authorization,
         doc_id: doc_id.to_string(),
         token,
+        ws_public_key: None,
     })
 }
 

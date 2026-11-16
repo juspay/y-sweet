@@ -6,3 +6,4 @@ pub mod metrics;
 pub mod otel;
 pub mod server;
 pub mod stores;
+pub mod ws_crypto;

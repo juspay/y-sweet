@@ -44,6 +44,7 @@ struct Opts {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum ServSubcommand {
     Serve {
         #[clap(env = "Y_SWEET_STORE")]
@@ -97,6 +98,16 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "30", env = "Y_SWEET_OTEL_PUSH_INTERVAL")]
         otel_push_interval_secs: u64,
+
+        /// Encrypt every WebSocket frame. Requires Y_SWEET_WS_PRIVATE_KEY.
+        #[clap(long, default_value = "false", env = "Y_SWEET_WS_ENCRYPTION")]
+        ws_encryption: bool,
+
+        /// Base64 PKCS#8 DER RSA private key (>= 2048 bits), used when Y_SWEET_WS_ENCRYPTION is
+        /// on. `openssl genpkey` writes PKCS#1 DER, so convert it:
+        /// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8 -topk8 -nocrypt -outform DER | base64`
+        #[clap(long, env = "Y_SWEET_WS_PRIVATE_KEY", hide_env_values = true)]
+        ws_private_key: Option<String>,
 
         #[clap(flatten)]
         gcs: GcsArgs,
@@ -266,6 +277,8 @@ async fn main() -> Result<()> {
             otel_endpoint,
             otel_service_name,
             otel_push_interval_secs,
+            ws_encryption,
+            ws_private_key,
             gcs,
         } => {
             let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
@@ -305,6 +318,19 @@ async fn main() -> Result<()> {
                 print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
             }
 
+            let ws_key = if *ws_encryption {
+                let key = ws_private_key
+                    .as_deref()
+                    .filter(|k| !k.is_empty())
+                    .context("Y_SWEET_WS_ENCRYPTION requires Y_SWEET_WS_PRIVATE_KEY to be set")?;
+                Some(
+                    y_sweet::ws_crypto::WsKey::from_base64_pkcs8(key)
+                        .context("Invalid Y_SWEET_WS_PRIVATE_KEY")?,
+                )
+            } else {
+                None
+            };
+
             let token = CancellationToken::new();
 
             let server = y_sweet::server::Server::new(
@@ -323,7 +349,8 @@ async fn main() -> Result<()> {
                 *validate_retry_attempts,
                 std::time::Duration::from_millis(*validate_retry_delay_ms),
             )
-            .await?;
+            .await?
+            .with_ws_encryption(ws_key);
 
             let prod = *prod;
             let handle = tokio::spawn(async move {

@@ -792,7 +792,8 @@ async fn handle_socket_upgrade(
     user_id: Option<String>,
     State(server_state): State<Arc<Server>>,
 ) -> Result<Response, AppError> {
-    if !matches!(authorization, Authorization::Full) && !server_state.docs.contains_key(&doc_id) {
+    // Read-only clients may open a stored doc that is not loaded yet, but never create one.
+    if !matches!(authorization, Authorization::Full) && !server_state.doc_exists(&doc_id).await {
         return Err(AppError(
             StatusCode::NOT_FOUND,
             anyhow!("Doc {} not found", doc_id),

@@ -3,6 +3,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use std::{
+    collections::HashMap,
     env,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
@@ -14,6 +15,7 @@ use tracing::metadata::LevelFilter;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use url::Url;
 use y_sweet::cli::{print_auth_message, print_server_url};
+use y_sweet::kms_secrets::load_kms_secrets;
 use y_sweet::stores::filesystem::FileSystemStore;
 use y_sweet::stores::gcs::{GcsOptions, GcsStore};
 use y_sweet::stores::s3::{S3Store, S3StoreConfig};
@@ -274,6 +276,24 @@ fn secret_value(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Optio
     }
 }
 
+/// A secret from KMS (see `kms_secrets`) when `SECRETS_KMS_KEY_NAME` is set and it was
+/// decrypted; otherwise as `secret_value`. With KMS on, the env var holds ciphertext, so the
+/// decrypted value replaces it.
+fn resolve_secret(
+    kms: &HashMap<String, String>,
+    key: &str,
+    inline: &Option<String>,
+    file: &Option<PathBuf>,
+) -> Result<Option<String>> {
+    if let Some(value) = kms.get(key) {
+        if file.is_some() {
+            anyhow::bail!("{key} is given both as a KMS ciphertext and as a file; use one");
+        }
+        return Ok(Some(value.clone()));
+    }
+    secret_value(inline, file)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -317,9 +337,20 @@ async fn main() -> Result<()> {
             ws_private_key_file,
             gcs,
         } => {
-            let auth = &secret_value(auth, auth_file)?;
-            let server_token = &secret_value(server_token, server_token_file)?;
-            let ws_private_key = &secret_value(ws_private_key, ws_private_key_file)?;
+            let kms = load_kms_secrets().await?;
+            let auth = &resolve_secret(&kms, "Y_SWEET_AUTH", auth, auth_file)?;
+            let server_token = &resolve_secret(
+                &kms,
+                "Y_SWEET_SERVER_TOKEN",
+                server_token,
+                server_token_file,
+            )?;
+            let ws_private_key = &resolve_secret(
+                &kms,
+                "Y_SWEET_WS_PRIVATE_KEY",
+                ws_private_key,
+                ws_private_key_file,
+            )?;
             let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
@@ -432,6 +463,8 @@ async fn main() -> Result<()> {
             server_token,
             gcs,
         } => {
+            let kms = load_kms_secrets().await?;
+            let server_token = &resolve_secret(&kms, "Y_SWEET_SERVER_TOKEN", server_token, &None)?;
             let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
             let store = get_store_from_opts(store, gcs).await?;
             store.init().await?;
@@ -458,6 +491,8 @@ async fn main() -> Result<()> {
             server_token,
             gcs,
         } => {
+            let kms = load_kms_secrets().await?;
+            let server_token = &resolve_secret(&kms, "Y_SWEET_SERVER_TOKEN", server_token, &None)?;
             let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
@@ -602,6 +637,22 @@ mod tests {
     fn secret_value_missing_file_errors() {
         let path = PathBuf::from("/nonexistent/y-sweet-secret");
         assert!(secret_value(&None, &Some(path)).is_err());
+    }
+
+    #[test]
+    fn resolve_secret_prefers_kms() {
+        let kms = HashMap::from([("Y_SWEET_AUTH".to_string(), "plain".to_string())]);
+        let got = resolve_secret(&kms, "Y_SWEET_AUTH", &Some("ciphertext".into()), &None).unwrap();
+        assert_eq!(got.as_deref(), Some("plain"));
+        let got = resolve_secret(&kms, "Y_SWEET_SERVER_TOKEN", &Some("x".into()), &None).unwrap();
+        assert_eq!(got.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn resolve_secret_kms_and_file_conflict() {
+        let kms = HashMap::from([("Y_SWEET_AUTH".to_string(), "plain".to_string())]);
+        let file = Some(PathBuf::from("/tmp/x"));
+        assert!(resolve_secret(&kms, "Y_SWEET_AUTH", &None, &file).is_err());
     }
 
     #[test]

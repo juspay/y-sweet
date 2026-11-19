@@ -28,6 +28,13 @@ pub struct AuthDocRequest {
     pub user_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "validForSeconds")]
     pub valid_for_seconds: Option<u64>,
+    /// Return a single-use WebSocket ticket instead of a signed token.
+    #[serde(default)]
+    pub ticket: bool,
+    /// Base64 SHA-256 of the client's handshake frame. The ticket then only opens a socket
+    /// whose first frame has this hash.
+    #[serde(default, rename = "wsHandshakeHash")]
+    pub ws_handshake_hash: Option<String>,
 }
 
 impl Default for AuthDocRequest {
@@ -36,6 +43,8 @@ impl Default for AuthDocRequest {
             authorization: Authorization::Full,
             user_id: None,
             valid_for_seconds: None,
+            ticket: false,
+            ws_handshake_hash: None,
         }
     }
 }
@@ -61,6 +70,14 @@ pub struct ClientToken {
     /// The authorization level of the client.
     #[serde(rename = "authorization")]
     pub authorization: Authorization,
+
+    /// Base64 SPKI RSA key for WebSocket frame encryption, when the server has one.
+    #[serde(
+        rename = "wsPublicKey",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub ws_public_key: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -82,4 +99,18 @@ pub fn validate_doc_name(doc_name: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_auth_doc_request_without_ticket() {
+        let req: AuthDocRequest =
+            serde_json::from_str(r#"{"userId":"u1","validForSeconds":60}"#).unwrap();
+        assert!(!req.ticket);
+        let req: AuthDocRequest = serde_json::from_str(r#"{"userId":"u1","ticket":true}"#).unwrap();
+        assert!(req.ticket);
+    }
 }

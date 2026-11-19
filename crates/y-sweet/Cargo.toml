@@ -10,6 +10,7 @@ repository = "https://github.com/drifting-in-space/y-sweet"
 [dependencies]
 anyhow = "1.0.72"
 async-trait = "0.1.71"
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "alloc"] }
 base64 = "0.22"
 aws-config = "1"
 aws-sdk-s3 = "1"
@@ -23,6 +24,7 @@ clap = { version = "4.3.12", features = ["derive", "env"] }
 colored = "2.0.4"
 dashmap = "6.0.1"
 futures = "0.3.28"
+getrandom = "0.2"
 headers = "0.4.0"
 lib0 = "0.16.9"
 moka = { version = "0.12", features = ["future"] }
@@ -46,3 +48,4 @@ yrs-kvstore = "0.3.0"
 
 [dev-dependencies]
 http = "1.1.0"
+tokio-tungstenite = "0.21"

@@ -60,11 +60,23 @@ enum ServSubcommand {
         #[clap(long, env = "Y_SWEET_AUTH")]
         auth: Option<String>,
 
+        /// Read the auth key from this file instead of Y_SWEET_AUTH (e.g. a mounted Secret).
+        #[clap(long, env = "Y_SWEET_AUTH_FILE", conflicts_with = "auth")]
+        auth_file: Option<PathBuf>,
+
         #[clap(long, env = "Y_SWEET_BACKEND_URL")]
         backend_url: Option<String>,
 
         #[clap(long, env = "Y_SWEET_SERVER_TOKEN")]
         server_token: Option<String>,
+
+        /// Read the server token from this file instead of Y_SWEET_SERVER_TOKEN.
+        #[clap(
+            long,
+            env = "Y_SWEET_SERVER_TOKEN_FILE",
+            conflicts_with = "server_token"
+        )]
+        server_token_file: Option<PathBuf>,
 
         #[clap(long, default_value = "10", env = "Y_SWEET_VALIDATE_POLL_SECONDS")]
         validate_poll_seconds: u64,
@@ -108,6 +120,14 @@ enum ServSubcommand {
         /// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8 -topk8 -nocrypt -outform DER | base64`
         #[clap(long, env = "Y_SWEET_WS_PRIVATE_KEY", hide_env_values = true)]
         ws_private_key: Option<String>,
+
+        /// Read the WebSocket private key from this file instead of Y_SWEET_WS_PRIVATE_KEY.
+        #[clap(
+            long,
+            env = "Y_SWEET_WS_PRIVATE_KEY_FILE",
+            conflicts_with = "ws_private_key"
+        )]
+        ws_private_key_file: Option<PathBuf>,
 
         #[clap(flatten)]
         gcs: GcsArgs,
@@ -241,6 +261,19 @@ async fn get_store_from_opts(store_path: &str, gcs: GcsOptions) -> Result<Box<dy
     get_store_from_target(parse_store_target(store_path)?, gcs).await
 }
 
+/// A secret given inline, or read from a file (surrounding whitespace, such as the trailing
+/// newline most editors and `kubectl create secret --from-file` keep, is trimmed).
+fn secret_value(inline: &Option<String>, file: &Option<PathBuf>) -> Result<Option<String>> {
+    match file {
+        Some(path) => {
+            let value = std::fs::read_to_string(path)
+                .with_context(|| format!("Failed to read secret file {}", path.display()))?;
+            Ok(Some(value.trim().to_string()))
+        }
+        None => Ok(inline.clone()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -264,8 +297,10 @@ async fn main() -> Result<()> {
             checkpoint_freq_seconds,
             store,
             auth,
+            auth_file,
             backend_url,
             server_token,
+            server_token_file,
             validate_poll_seconds,
             validate_retry_attempts,
             validate_retry_delay_ms,
@@ -279,8 +314,12 @@ async fn main() -> Result<()> {
             otel_push_interval_secs,
             ws_encryption,
             ws_private_key,
+            ws_private_key_file,
             gcs,
         } => {
+            let auth = &secret_value(auth, auth_file)?;
+            let server_token = &secret_value(server_token, server_token_file)?;
+            let ws_private_key = &secret_value(ws_private_key, ws_private_key_file)?;
             let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
@@ -533,4 +572,42 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secret_value_prefers_file_and_trims() {
+        let path = std::env::temp_dir().join(format!("y-sweet-secret-{}", std::process::id()));
+        std::fs::write(&path, "  s3cret\n").unwrap();
+        let got = secret_value(&None, &Some(path.clone())).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(got.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn secret_value_falls_back_to_inline() {
+        assert_eq!(
+            secret_value(&Some("inline".into()), &None)
+                .unwrap()
+                .as_deref(),
+            Some("inline")
+        );
+        assert_eq!(secret_value(&None, &None).unwrap(), None);
+    }
+
+    #[test]
+    fn secret_value_missing_file_errors() {
+        let path = PathBuf::from("/nonexistent/y-sweet-secret");
+        assert!(secret_value(&None, &Some(path)).is_err());
+    }
+
+    #[test]
+    fn inline_and_file_conflict() {
+        let res =
+            Opts::try_parse_from(["y-sweet", "serve", "--auth", "x", "--auth-file", "/tmp/x"]);
+        assert!(res.is_err());
+    }
 }

@@ -15,12 +15,27 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use url::Url;
 use y_sweet::cli::{print_auth_message, print_server_url};
 use y_sweet::stores::filesystem::FileSystemStore;
-use y_sweet::stores::gcs::GcsStore;
+use y_sweet::stores::gcs::{GcsOptions, GcsStore};
 use y_sweet::stores::s3::{S3Store, S3StoreConfig};
-use y_sweet::stores::{parse_store_target, target_from_bucket_env, StoreTarget};
+use y_sweet::stores::{gcs_options, parse_store_target, target_from_bucket_env, StoreTarget};
 use y_sweet_core::{auth::Authenticator, store::Store};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Settings for GCS-backed stores.
+#[derive(clap::Args)]
+struct GcsArgs {
+    /// Encrypt each doc with a per-doc customer-supplied key (CSEK) issued by
+    /// the backend. Requires Y_SWEET_BACKEND_URL and Y_SWEET_SERVER_TOKEN.
+    #[clap(long, default_value = "false", env = "Y_SWEET_STORE_ENCRYPTION")]
+    store_encryption: bool,
+}
+
+impl GcsArgs {
+    fn options(&self, backend_url: Option<&str>, server_token: Option<&str>) -> Result<GcsOptions> {
+        gcs_options(self.store_encryption, backend_url, server_token)
+    }
+}
 
 #[derive(Parser)]
 struct Opts {
@@ -82,6 +97,9 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "30", env = "Y_SWEET_OTEL_PUSH_INTERVAL")]
         otel_push_interval_secs: u64,
+
+        #[clap(flatten)]
+        gcs: GcsArgs,
     },
 
     GenAuth {
@@ -98,6 +116,15 @@ enum ServSubcommand {
 
         /// The ID of the document to write.
         doc_id: String,
+
+        #[clap(long, env = "Y_SWEET_BACKEND_URL")]
+        backend_url: Option<String>,
+
+        #[clap(long, env = "Y_SWEET_SERVER_TOKEN")]
+        server_token: Option<String>,
+
+        #[clap(flatten)]
+        gcs: GcsArgs,
     },
 
     Version,
@@ -126,6 +153,16 @@ enum ServSubcommand {
 
         #[clap(long, default_value = "30", env = "Y_SWEET_OTEL_PUSH_INTERVAL")]
         otel_push_interval_secs: u64,
+
+        /// Only used to fetch storage keys when Y_SWEET_STORE_ENCRYPTION is on.
+        #[clap(long, env = "Y_SWEET_BACKEND_URL")]
+        backend_url: Option<String>,
+
+        #[clap(long, env = "Y_SWEET_SERVER_TOKEN")]
+        server_token: Option<String>,
+
+        #[clap(flatten)]
+        gcs: GcsArgs,
     },
 }
 
@@ -173,19 +210,24 @@ fn s3_store_config_from_env(bucket: String, prefix: Option<String>) -> Result<S3
     })
 }
 
-async fn get_store_from_target(target: StoreTarget) -> Result<Box<dyn Store>> {
+async fn get_store_from_target(target: StoreTarget, gcs: GcsOptions) -> Result<Box<dyn Store>> {
+    if gcs.key_provider.is_some() && !matches!(target, StoreTarget::Gcs { .. }) {
+        anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is only supported for gs:// stores");
+    }
     match target {
         StoreTarget::S3 { bucket, prefix } => {
             let config = s3_store_config_from_env(bucket, prefix)?;
             Ok(Box::new(S3Store::new(config).await))
         }
-        StoreTarget::Gcs { bucket, prefix } => Ok(Box::new(GcsStore::new(bucket, prefix).await?)),
+        StoreTarget::Gcs { bucket, prefix } => {
+            Ok(Box::new(GcsStore::with_options(bucket, prefix, gcs).await?))
+        }
         StoreTarget::Filesystem(path) => Ok(Box::new(FileSystemStore::new(PathBuf::from(path))?)),
     }
 }
 
-async fn get_store_from_opts(store_path: &str) -> Result<Box<dyn Store>> {
-    get_store_from_target(parse_store_target(store_path)?).await
+async fn get_store_from_opts(store_path: &str, gcs: GcsOptions) -> Result<Box<dyn Store>> {
+    get_store_from_target(parse_store_target(store_path)?, gcs).await
 }
 
 #[tokio::main]
@@ -224,7 +266,9 @@ async fn main() -> Result<()> {
             otel_endpoint,
             otel_service_name,
             otel_push_interval_secs,
+            gcs,
         } => {
+            let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
                 otel_service_name,
@@ -246,10 +290,13 @@ async fn main() -> Result<()> {
             let addr = listener.local_addr()?;
 
             let store = if let Some(store) = store {
-                let store = get_store_from_opts(store).await?;
+                let store = get_store_from_opts(store, gcs).await?;
                 store.init().await?;
                 Some(store)
             } else {
+                if gcs.key_provider.is_some() {
+                    anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is set but no store is configured");
+                }
                 tracing::warn!("No store set. Documents will be stored in memory only.");
                 None
             };
@@ -312,8 +359,15 @@ async fn main() -> Result<()> {
                 print_auth_message(&auth);
             }
         }
-        ServSubcommand::ConvertFromUpdate { store, doc_id } => {
-            let store = get_store_from_opts(store).await?;
+        ServSubcommand::ConvertFromUpdate {
+            store,
+            doc_id,
+            backend_url,
+            server_token,
+            gcs,
+        } => {
+            let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
+            let store = get_store_from_opts(store, gcs).await?;
             store.init().await?;
 
             let mut stdin = tokio::io::stdin();
@@ -334,7 +388,11 @@ async fn main() -> Result<()> {
             otel_endpoint,
             otel_service_name,
             otel_push_interval_secs,
+            backend_url,
+            server_token,
+            gcs,
         } => {
+            let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
                 otel_service_name,
@@ -365,12 +423,15 @@ async fn main() -> Result<()> {
                 };
 
                 let target = target_from_bucket_env(&bucket, prefix)?;
-                let store: Box<dyn Store> = get_store_from_target(target).await?;
+                let store: Box<dyn Store> = get_store_from_target(target, gcs).await?;
                 store.init().await?;
                 Some(store)
             } else {
                 if env::var("STORAGE_PREFIX").is_ok() {
                     anyhow::bail!("If STORAGE_PREFIX is set, STORAGE_BUCKET must also be set.");
+                }
+                if gcs.key_provider.is_some() {
+                    anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is set but STORAGE_BUCKET is not");
                 }
 
                 None

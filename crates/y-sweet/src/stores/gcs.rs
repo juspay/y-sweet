@@ -34,20 +34,40 @@ fn prefixed_key(prefix: &Option<String>, key: &str) -> String {
     }
 }
 
-fn gax_status(err: &google_cloud_gax::error::Error) -> Option<u16> {
-    err.http_status_code()
+/// How a GCS error is handled. `Storage` (JSON over HTTP) reports an HTTP status;
+/// `StorageControl` (gRPC, used for object metadata) reports only a gRPC code, so both
+/// are checked.
+#[derive(Debug, PartialEq)]
+enum GaxErrorKind {
+    NotFound,
+    NotAuthorized,
+    Other,
+}
+
+fn gax_error_kind(err: &google_cloud_gax::error::Error) -> GaxErrorKind {
+    use google_cloud_gax::error::rpc::Code;
+    match err.http_status_code() {
+        Some(404) => return GaxErrorKind::NotFound,
+        Some(401) | Some(403) => return GaxErrorKind::NotAuthorized,
+        _ => {}
+    }
+    match err.status().map(|s| s.code) {
+        Some(Code::NotFound) => GaxErrorKind::NotFound,
+        Some(Code::PermissionDenied) | Some(Code::Unauthenticated) => GaxErrorKind::NotAuthorized,
+        _ => GaxErrorKind::Other,
+    }
 }
 
 fn map_gax_error(op: &str, err: google_cloud_gax::error::Error) -> StoreError {
-    match gax_status(&err) {
-        Some(401) | Some(403) => StoreError::NotAuthorized(format!("{}: {}", op, err)),
-        Some(404) => StoreError::DoesNotExist(format!("{}: {}", op, err)),
-        _ => StoreError::ConnectionError(format!("{}: {}", op, err)),
+    match gax_error_kind(&err) {
+        GaxErrorKind::NotAuthorized => StoreError::NotAuthorized(format!("{}: {}", op, err)),
+        GaxErrorKind::NotFound => StoreError::DoesNotExist(format!("{}: {}", op, err)),
+        GaxErrorKind::Other => StoreError::ConnectionError(format!("{}: {}", op, err)),
     }
 }
 
 fn is_not_found(err: &google_cloud_gax::error::Error) -> bool {
-    gax_status(err) == Some(404)
+    gax_error_kind(err) == GaxErrorKind::NotFound
 }
 
 /// Recovers the doc id from an unprefixed store key (`<docId>/data.ysweet`).
@@ -339,6 +359,62 @@ impl Store for GcsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use google_cloud_gax::error::rpc::{Code, Status};
+    use google_cloud_gax::error::Error as GaxError;
+
+    fn grpc_error(code: Code) -> GaxError {
+        GaxError::service(Status::default().set_code(code).set_message("test"))
+    }
+
+    fn http_error(status: u16) -> GaxError {
+        GaxError::http(
+            status,
+            Default::default(),
+            bytes::Bytes::from_static(b"test"),
+        )
+    }
+
+    #[test]
+    fn grpc_not_found_is_not_found() {
+        // StorageControl::get_object on a doc that doesn't exist yet (a new canvas).
+        assert!(is_not_found(&grpc_error(Code::NotFound)));
+        assert!(matches!(
+            map_gax_error("get_object", grpc_error(Code::NotFound)),
+            StoreError::DoesNotExist(_)
+        ));
+    }
+
+    #[test]
+    fn http_not_found_is_not_found() {
+        assert!(is_not_found(&http_error(404)));
+    }
+
+    #[test]
+    fn auth_errors_map_from_both_forms() {
+        for err in [
+            grpc_error(Code::PermissionDenied),
+            grpc_error(Code::Unauthenticated),
+            http_error(401),
+            http_error(403),
+        ] {
+            assert!(!is_not_found(&err));
+            assert!(matches!(
+                map_gax_error("op", err),
+                StoreError::NotAuthorized(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn other_errors_are_connection_errors() {
+        for err in [grpc_error(Code::Unavailable), http_error(500)] {
+            assert!(!is_not_found(&err));
+            assert!(matches!(
+                map_gax_error("op", err),
+                StoreError::ConnectionError(_)
+            ));
+        }
+    }
 
     #[test]
     fn bucket_resource_name_format() {

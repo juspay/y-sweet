@@ -159,7 +159,7 @@ pub struct Server {
     metrics: Metrics,
     backend_url: Option<String>,
     /// Shared secret sent as `Authorization: Bearer <token>` on every call to
-    /// the backend's `/api/ysweet/validate`, so the backend can confirm the
+    /// the backend's `/internal/ysweet/validate`, so the backend can confirm the
     /// caller is actually y-sweet and not just anyone hitting that route.
     server_token: Option<String>,
     http_client: reqwest::Client,
@@ -266,7 +266,7 @@ impl Server {
         let Some(backend_url) = &self.backend_url else {
             return false;
         };
-        let url = format!("{}/api/ysweet/validate", backend_url.trim_end_matches('/'));
+        let url = format!("{}/internal/ysweet/validate", backend_url.trim_end_matches('/'));
         let mut req = self.http_client.post(&url).json(&serde_json::json!({
             "docId": doc_id,
             "userId": user_id,
@@ -1899,7 +1899,7 @@ mod test {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_url = format!("http://{}", backend.local_addr().unwrap());
         let app = axum::Router::new().route(
-            "/api/ysweet/validate",
+            "/internal/ysweet/validate",
             axum::routing::post(|| async { Json(json!({ "ok": true })) }),
         );
         tokio::spawn(async move { axum::serve(backend, app).await });

@@ -1,5 +1,5 @@
 use crate::metrics::Metrics;
-use crate::ws_crypto::{self, FrameCipher, WsKey};
+use crate::ws_crypto::{self, FrameCipher, Grant, WsGrantKey};
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
@@ -17,10 +17,7 @@ use axum::{
     Json, Router,
 };
 use axum_extra::typed_header::TypedHeader;
-use base64::{
-    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use dashmap::{mapref::one::MappedRef, DashMap};
 use futures::{SinkExt, StreamExt};
 use moka::{future::Cache, policy::EvictionPolicy};
@@ -77,7 +74,10 @@ const TICKET_PREFIX: &str = "tkt~";
 const TICKET_TTL: Duration = Duration::from_secs(30);
 const TICKET_MAX_CAPACITY: u64 = 100_000;
 
-const WS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+// Covers a grant's whole life: it expires 30 s after the encryption service mints it.
+// In memory, so it holds for one replica only.
+const GRANT_MEMORY: Duration = Duration::from_secs(60);
+const GRANT_LIFETIME_MS: u64 = 30_000;
 
 #[derive(Clone)]
 struct Ticket {
@@ -86,18 +86,15 @@ struct Ticket {
     authorization: Authorization,
     // moka's `remove` still returns entries past their TTL until they are evicted.
     expires_at: std::time::Instant,
-    ws_handshake_hash: Option<[u8; 32]>,
+    grant: Option<Grant>,
 }
 
 #[derive(Clone)]
-struct VerifiedIdentity(Authorization, Option<String>, Option<[u8; 32]>);
+struct VerifiedIdentity(Authorization, Option<String>, Option<Grant>);
 
-/// How a socket must open.
-#[derive(Clone, Copy)]
 enum SocketCrypto {
     Plain,
-    /// A handshake is required. With a hash, the handshake frame must match it.
-    Encrypted(Option<[u8; 32]>),
+    Encrypted(Grant),
 }
 
 fn current_time_epoch_millis() -> u64 {
@@ -167,7 +164,14 @@ pub struct Server {
     validate_retry_attempts: u32,
     validate_retry_delay: Duration,
     tickets: Cache<String, Ticket>,
-    ws_key: Option<WsKey>,
+    ws_grant_key: Option<WsGrantKey>,
+    /// SHA-256 of every wsKey turned into a ticket, so one socket key never serves two sockets.
+    seen_grants: Cache<[u8; 32], ()>,
+    revoked_sids: Cache<String, ()>,
+    sessions: DashMap<String, Vec<(u64, CancellationToken)>>,
+    next_conn_id: std::sync::atomic::AtomicU64,
+    /// Grants minted before this were not in `seen_grants`, so they may already be used.
+    started_ms: u64,
 }
 
 impl Server {
@@ -228,26 +232,84 @@ impl Server {
                 .max_capacity(TICKET_MAX_CAPACITY)
                 .eviction_policy(EvictionPolicy::lru())
                 .build(),
-            ws_key: None,
+            ws_grant_key: None,
+            seen_grants: Cache::builder()
+                .time_to_live(GRANT_MEMORY)
+                .eviction_policy(EvictionPolicy::lru())
+                .build(),
+            revoked_sids: Cache::builder()
+                .time_to_live(GRANT_MEMORY)
+                .eviction_policy(EvictionPolicy::lru())
+                .build(),
+            sessions: DashMap::new(),
+            next_conn_id: Default::default(),
+            started_ms: current_time_epoch_millis(),
         })
     }
 
-    /// With a key, every socket must open with an encryption handshake.
-    pub fn with_ws_encryption(mut self, ws_key: Option<WsKey>) -> Self {
-        self.ws_key = ws_key;
+    /// With a key, every socket must use a ticket that carries a socket key.
+    pub fn with_ws_encryption(mut self, ws_grant_key: Option<WsGrantKey>) -> Self {
+        self.ws_grant_key = ws_grant_key;
         self
     }
 
-    fn socket_crypto(&self, ws_handshake_hash: Option<[u8; 32]>) -> Result<SocketCrypto, AppError> {
-        match (&self.ws_key, ws_handshake_hash) {
-            (None, _) => Ok(SocketCrypto::Plain),
-            (Some(_), Some(hash)) => Ok(SocketCrypto::Encrypted(Some(hash))),
-            // An unbound credential lets whoever holds it run their own handshake.
-            (Some(_), None) if self.authenticator.is_some() => Err(AppError(
+    fn socket_crypto(&self, grant: Option<Grant>) -> Result<SocketCrypto, AppError> {
+        if self.ws_grant_key.is_none() {
+            return Ok(SocketCrypto::Plain);
+        }
+        match grant {
+            Some(g) if !self.revoked_sids.contains_key(&g.sid) => Ok(SocketCrypto::Encrypted(g)),
+            Some(_) => Err(AppError(
                 StatusCode::UNAUTHORIZED,
-                anyhow!("WebSocket encryption requires a ticket bound to the handshake"),
+                anyhow!("Session revoked"),
             )),
-            (Some(_), None) => Ok(SocketCrypto::Encrypted(None)),
+            None => Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("WebSocket encryption requires a ticket with a socket key"),
+            )),
+        }
+    }
+
+    /// Checks a wrapped socket key from the backend and marks it used.
+    async fn accept_grant(
+        &self,
+        key: &WsGrantKey,
+        w: &str,
+        doc_id: &str,
+    ) -> Result<Grant, AppError> {
+        let bad = |e: anyhow::Error| AppError(StatusCode::BAD_REQUEST, e);
+        let grant = key.unwrap_grant(w).map_err(bad)?;
+        if grant.doc != doc_id {
+            return Err(bad(anyhow!("wsKey is for another doc")));
+        }
+        if grant.exp <= current_time_epoch_millis() {
+            return Err(bad(anyhow!("wsKey expired")));
+        }
+        if grant.exp.saturating_sub(GRANT_LIFETIME_MS) < self.started_ms {
+            return Err(bad(anyhow!("wsKey minted before this server started")));
+        }
+        if self.revoked_sids.contains_key(&grant.sid) {
+            return Err(AppError(
+                StatusCode::UNAUTHORIZED,
+                anyhow!("Session revoked"),
+            ));
+        }
+        let hash: [u8; 32] = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, w.as_bytes())
+            .as_ref()
+            .try_into()
+            .expect("SHA-256 is 32 bytes");
+        if !self.seen_grants.entry(hash).or_insert(()).await.is_fresh() {
+            return Err(bad(anyhow!("wsKey already used")));
+        }
+        Ok(grant)
+    }
+
+    async fn close_sessions(&self, sids: &[String]) {
+        for sid in sids {
+            self.revoked_sids.insert(sid.clone(), ()).await;
+            if let Some((_, conns)) = self.sessions.remove(sid) {
+                conns.iter().for_each(|(_, cancel)| cancel.cancel());
+            }
         }
     }
 
@@ -295,7 +357,10 @@ impl Server {
         authorization: &Authorization,
     ) -> bool {
         for attempt in 1..=self.validate_retry_attempts {
-            if self.validate_user_access(doc_id, user_id, authorization).await {
+            if self
+                .validate_user_access(doc_id, user_id, authorization)
+                .await
+            {
                 return true;
             }
             if attempt < self.validate_retry_attempts {
@@ -316,12 +381,18 @@ impl Server {
         user_id: &str,
         authorization: &Authorization,
     ) -> bool {
-        if self.validate_user_access(doc_id, user_id, authorization).await {
+        if self
+            .validate_user_access(doc_id, user_id, authorization)
+            .await
+        {
             return true;
         }
         for delay in CONNECT_VALIDATE_RETRY_DELAYS {
             tokio::time::sleep(delay).await;
-            if self.validate_user_access(doc_id, user_id, authorization).await {
+            if self
+                .validate_user_access(doc_id, user_id, authorization)
+                .await
+            {
                 return true;
             }
         }
@@ -584,6 +655,7 @@ impl Server {
             .route("/check_store", get(check_store_deprecated))
             .route("/doc/new", post(new_doc))
             .route("/doc/:doc_id/auth", post(auth_doc))
+            .route("/internal/close-sessions", post(close_sessions))
             .merge(protected)
             .with_state(self.clone())
     }
@@ -666,7 +738,7 @@ impl Server {
         doc_id: &str,
         user_id: String,
         authorization: Authorization,
-        ws_handshake_hash: Option<[u8; 32]>,
+        grant: Option<Grant>,
     ) -> Result<String> {
         let mut bytes = [0u8; 32];
         getrandom::getrandom(&mut bytes)?;
@@ -679,7 +751,7 @@ impl Server {
                     user_id,
                     authorization,
                     expires_at: std::time::Instant::now() + TICKET_TTL,
-                    ws_handshake_hash,
+                    grant,
                 },
             )
             .await;
@@ -692,8 +764,15 @@ impl Server {
         token: &str,
         doc_id: &str,
         websocket: bool,
-    ) -> Result<(Authorization, Option<String>, Option<[u8; 32]>), AppError> {
+    ) -> Result<(Authorization, Option<String>, Option<Grant>), AppError> {
         if !token.starts_with(TICKET_PREFIX) {
+            // In both modes: a socket needs a ticket, a signed token is for the backend's HTTP calls.
+            if websocket {
+                return Err(AppError(
+                    StatusCode::UNAUTHORIZED,
+                    anyhow!("WebSocket connections need a ticket"),
+                ));
+            }
             let (authorization, user_id) = self.verify_doc_token(Some(token), doc_id)?;
             return Ok((authorization, user_id, None));
         }
@@ -705,7 +784,7 @@ impl Server {
         }
         match self.tickets.remove(token).await {
             Some(t) if t.doc_id == doc_id && std::time::Instant::now() < t.expires_at => {
-                Ok((t.authorization, Some(t.user_id), t.ws_handshake_hash))
+                Ok((t.authorization, Some(t.user_id), t.grant))
             }
             _ => Err(AppError(
                 StatusCode::UNAUTHORIZED,
@@ -873,6 +952,13 @@ async fn handle_socket_upgrade_deprecated(
     tracing::warn!(
         "/doc/ws/:doc_id is deprecated; call /doc/:doc_id/auth instead and use the returned URL."
     );
+    // This route takes no ticket, and signed tokens no longer open sockets.
+    if server_state.authenticator.is_some() {
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            anyhow!("WebSocket connections need a ticket"),
+        ));
+    }
     let (authorization, user_id) =
         server_state.verify_doc_token(params.token.as_deref(), &doc_id)?;
     let crypto = server_state.socket_crypto(None)?;
@@ -901,9 +987,9 @@ async fn handle_socket_upgrade_full_path(
         ));
     }
     // A ticket is gone once the middleware consumes it, so reuse the middleware's result.
-    let (authorization, user_id, ws_handshake_hash) = match identity {
-        Some(Extension(VerifiedIdentity(authorization, user_id, hash))) => {
-            (authorization, user_id, hash)
+    let (authorization, user_id, grant) = match identity {
+        Some(Extension(VerifiedIdentity(authorization, user_id, grant))) => {
+            (authorization, user_id, grant)
         }
         None => {
             let (authorization, user_id) =
@@ -911,7 +997,7 @@ async fn handle_socket_upgrade_full_path(
             (authorization, user_id, None)
         }
     };
-    let crypto = server_state.socket_crypto(ws_handshake_hash)?;
+    let crypto = server_state.socket_crypto(grant)?;
     handle_socket_upgrade(
         ws,
         Path(doc_id),
@@ -955,7 +1041,7 @@ async fn handle_socket_upgrade_single(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_socket(
-    mut socket: WebSocket,
+    socket: WebSocket,
     awareness: Arc<RwLock<Awareness>>,
     authorization: Authorization,
     user_id: Option<String>,
@@ -965,26 +1051,26 @@ async fn handle_socket(
     server_state: Arc<Server>,
     crypto: SocketCrypto,
 ) {
-    let (mut sealer, mut opener) = (None::<FrameCipher>, None::<FrameCipher>);
-    if let (SocketCrypto::Encrypted(hash), Some(key)) = (crypto, &server_state.ws_key) {
-        let frame = match tokio::time::timeout(WS_HANDSHAKE_TIMEOUT, socket.recv()).await {
-            Ok(Some(Ok(Message::Binary(frame)))) => frame,
-            _ => {
-                tracing::warn!(doc_id = %doc_id, "No WebSocket encryption handshake; closing");
-                return;
-            }
-        };
-        if hash.is_some_and(|hash| ws_crypto::handshake_hash(&frame) != hash) {
-            tracing::warn!(doc_id = %doc_id, "Handshake does not match the ticket; closing");
-            return;
+    let conn_cancel = CancellationToken::new();
+    let (mut sealer, mut opener, mut session) = (None::<FrameCipher>, None::<FrameCipher>, None);
+    if let SocketCrypto::Encrypted(grant) = crypto {
+        sealer =
+            Some(FrameCipher::new(&grant.key, ws_crypto::SERVER_TO_CLIENT).expect("32-byte key"));
+        opener =
+            Some(FrameCipher::new(&grant.key, ws_crypto::CLIENT_TO_SERVER).expect("32-byte key"));
+        let conn_id = server_state
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        server_state
+            .sessions
+            .entry(grant.sid.clone())
+            .or_default()
+            .push((conn_id, conn_cancel.clone()));
+        // A revoke between the upgrade check and the insert above would otherwise miss this socket.
+        if server_state.revoked_sids.contains_key(&grant.sid) {
+            conn_cancel.cancel();
         }
-        match key.handshake(&frame) {
-            Ok((s, o)) => (sealer, opener) = (Some(s), Some(o)),
-            Err(e) => {
-                tracing::warn!(doc_id = %doc_id, ?e, "Bad WebSocket encryption handshake; closing");
-                return;
-            }
-        }
+        session = Some((grant.sid, conn_id));
     }
 
     metrics.active_connections.add(1, &[]);
@@ -995,7 +1081,6 @@ async fn handle_socket(
     let last_pong_clone = last_pong.clone();
     let pong_metrics = metrics.clone();
     let pong_doc_id = doc_id.clone();
-    let conn_cancel = CancellationToken::new();
     let conn_cancel_ping = conn_cancel.clone();
 
     tokio::spawn(async move {
@@ -1126,12 +1211,18 @@ async fn handle_socket(
                 break;
             }
             _ = conn_cancel.cancelled() => {
-                tracing::debug!(doc_id = %doc_id, "Closing doc connection after pong timeout");
+                tracing::debug!(doc_id = %doc_id, "Closing doc connection: pong timeout, access lost or session closed");
                 break;
             }
         }
     }
 
+    if let Some((sid, conn_id)) = session {
+        server_state.sessions.remove_if_mut(&sid, |_, conns| {
+            conns.retain(|(id, _)| *id != conn_id);
+            conns.is_empty()
+        });
+    }
     metrics.active_connections.add(-1, &[]);
 }
 
@@ -1210,20 +1301,8 @@ async fn auth_doc(
         user_id,
         valid_for_seconds,
         ticket,
-        ws_handshake_hash,
+        ws_key,
     }) = body.unwrap_or_default();
-
-    let ws_handshake_hash = ws_handshake_hash
-        .map(|h| {
-            STANDARD
-                .decode(h)
-                .ok()
-                .and_then(|b| <[u8; 32]>::try_from(b).ok())
-                .ok_or_else(|| {
-                    AppError(StatusCode::BAD_REQUEST, anyhow!("Invalid wsHandshakeHash"))
-                })
-        })
-        .transpose()?;
 
     let Some(user_id) = user_id else {
         Err((StatusCode::FORBIDDEN, anyhow!("userId is required")))?
@@ -1237,11 +1316,20 @@ async fn auth_doc(
     let expiration_time =
         ExpirationTimeEpochMillis(current_time_epoch_millis() + valid_for_seconds * 1000);
 
+    // With encryption off, wsKey is ignored and the ticket opens a plain socket.
+    let grant = match (&server_state.ws_grant_key, ws_key, ticket) {
+        (Some(key), Some(w), true) => Some(server_state.accept_grant(key, &w, &doc_id).await?),
+        // The socket would be refused at the upgrade, so refuse the ticket now.
+        (Some(_), None, true) => Err((StatusCode::CONFLICT, anyhow!("wsKey is required")))?,
+        _ => None,
+    };
+    let ws_encrypted = grant.is_some() && server_state.authenticator.is_some();
+
     let token = match &server_state.authenticator {
         None => None,
         Some(_) if ticket => Some(
             server_state
-                .issue_ticket(&doc_id, user_id, authorization, ws_handshake_hash)
+                .issue_ticket(&doc_id, user_id, authorization, grant)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?,
         ),
@@ -1252,12 +1340,18 @@ async fn auth_doc(
 
     let url = if let Some(url_prefix) = &server_state.url_prefix {
         let mut url_prefix = url_prefix.clone();
-        let scheme = if url_prefix.scheme() == "https" { "wss" } else { "ws" };
+        let scheme = if url_prefix.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        };
         url_prefix.set_scheme(scheme).unwrap();
         let mut url_str = url_prefix.to_string();
         if !url_str.ends_with('/') {
             url_str.push('/');
         }
+        // TODO: nothing in y-sweet or xyne-spaces reads `?docId=` (added in aba7029). Check the
+        // ingress, LB and log rules, then remove it here, below and in the three URL tests.
         format!("{url_str}d/{doc_id}/ws?docId={doc_id}")
     } else {
         format!("ws://{host}/d/{doc_id}/ws?docId={doc_id}")
@@ -1280,8 +1374,25 @@ async fn auth_doc(
         doc_id,
         token,
         authorization,
-        ws_public_key: server_state.ws_key.as_ref().map(|k| k.public_key().to_string()),
+        ws_encrypted,
     }))
+}
+
+#[derive(Deserialize)]
+struct CloseSessionsRequest {
+    sids: Vec<String>,
+}
+
+/// Closes every encrypted socket of these auth sessions and refuses their unused tickets.
+/// Plain sockets carry no sid, so they stay open.
+async fn close_sessions(
+    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
+    State(server_state): State<Arc<Server>>,
+    Json(body): Json<CloseSessionsRequest>,
+) -> Result<StatusCode, AppError> {
+    server_state.check_auth(auth_header)?;
+    server_state.close_sessions(&body.sids).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Runs in front of `as-update`, `update`, and the WebSocket-upgrade routes.
@@ -1309,14 +1420,11 @@ async fn validate_user_middleware(
 
     // Only `/d/:doc_id/ws/:doc_id2` has a second doc id.
     let websocket = params.contains_key("doc_id2");
-    let (authorization, user_id, ws_handshake_hash) = server_state
+    let (authorization, user_id, grant) = server_state
         .verify_token_or_ticket(&token, &doc_id, websocket)
         .await?;
-    req.extensions_mut().insert(VerifiedIdentity(
-        authorization,
-        user_id.clone(),
-        ws_handshake_hash,
-    ));
+    req.extensions_mut()
+        .insert(VerifiedIdentity(authorization, user_id.clone(), grant));
 
     let Some(user_id) = user_id else {
         return Err(AppError(
@@ -1337,7 +1445,8 @@ async fn validate_user_middleware(
 
 fn extract_request_token(req: &Request) -> Option<String> {
     if let Some(query) = req.uri().query() {
-        if let Some((_, v)) = url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == "token")
+        if let Some((_, v)) =
+            url::form_urlencoded::parse(query.as_bytes()).find(|(k, _)| k == "token")
         {
             return Some(v.into_owned());
         }
@@ -1415,7 +1524,7 @@ mod test {
                 user_id: Some("u1".to_string()),
                 valid_for_seconds: None,
                 ticket: false,
-                ws_handshake_hash: None,
+                ws_key: None,
             })),
         )
         .await
@@ -1425,7 +1534,7 @@ mod test {
         assert_eq!(token.url, expected_url);
         assert_eq!(token.doc_id, doc_id);
         assert!(token.token.is_none());
-        assert!(!serde_json::to_string(&token.0).unwrap().contains("wsPublicKey"));
+        assert!(!token.ws_encrypted);
     }
 
     #[tokio::test]
@@ -1615,7 +1724,7 @@ mod test {
         server: &Arc<Server>,
         doc_id: &str,
         ticket: bool,
-        ws_handshake_hash: Option<String>,
+        ws_key: Option<String>,
     ) -> Result<Json<ClientToken>, AppError> {
         let server_token = server.authenticator.as_ref().unwrap().server_token();
         auth_doc(
@@ -1632,7 +1741,7 @@ mod test {
                 user_id: Some("u1".to_string()),
                 valid_for_seconds: None,
                 ticket,
-                ws_handshake_hash,
+                ws_key,
             })),
         )
         .await
@@ -1700,20 +1809,24 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_signed_token_still_accepted() {
+    async fn test_signed_token_http_only() {
         let (server, doc_id) = ticket_server().await;
         let token = request_token(&server, &doc_id, false).await;
         assert!(!token.starts_with(TICKET_PREFIX));
-        for websocket in [true, false, true] {
+        for _ in 0..2 {
             let (_, user_id, _) = server
-                .verify_token_or_ticket(&token, &doc_id, websocket)
+                .verify_token_or_ticket(&token, &doc_id, false)
                 .await
                 .unwrap();
             assert_eq!(user_id.as_deref(), Some("u1"));
         }
+        let Err(err) = server.verify_token_or_ticket(&token, &doc_id, true).await else {
+            panic!("a signed token opened a socket");
+        };
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
     }
 
-    async fn ws_server(ws_key: Option<&str>) -> String {
+    async fn ws_server() -> String {
         let server = Server::new(
             None,
             Duration::from_secs(60),
@@ -1731,8 +1844,7 @@ mod test {
             DEFAULT_VALIDATE_RETRY_DELAY,
         )
         .await
-        .unwrap()
-        .with_ws_encryption(ws_key.map(|k| WsKey::from_base64_pkcs8(k).unwrap()));
+        .unwrap();
         let doc_id = server.create_doc().await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1779,51 +1891,8 @@ mod test {
     const SYNC_STEP_1_EMPTY: [u8; 4] = [0, 0, 1, 0];
 
     #[tokio::test]
-    async fn test_auth_doc_returns_ws_public_key() {
-        let b64 = crate::ws_crypto::test::gen_key_b64();
-        let key = WsKey::from_base64_pkcs8(&b64).unwrap();
-        let server = Server::new(
-            None,
-            Duration::from_secs(60),
-            None,
-            None,
-            None,
-            CancellationToken::new(),
-            true,
-            None,
-            false,
-            None,
-            None,
-            DEFAULT_VALIDATE_POLL_EVERY,
-            DEFAULT_VALIDATE_RETRY_ATTEMPTS,
-            DEFAULT_VALIDATE_RETRY_DELAY,
-        )
-        .await
-        .unwrap()
-        .with_ws_encryption(Some(WsKey::from_base64_pkcs8(&b64).unwrap()));
-        let doc_id = server.create_doc().await.unwrap();
-        let token = auth_doc(
-            None,
-            TypedHeader(headers::Host::from(http::uri::Authority::from_static(
-                "localhost",
-            ))),
-            State(Arc::new(server)),
-            Path(doc_id),
-            Some(Json(AuthDocRequest {
-                user_id: Some("u1".to_string()),
-                ..Default::default()
-            })),
-        )
-        .await
-        .unwrap();
-        assert_eq!(token.ws_public_key.as_deref(), Some(key.public_key()));
-        let json = serde_json::to_value(&token.0).unwrap();
-        assert_eq!(json["wsPublicKey"], key.public_key());
-    }
-
-    #[tokio::test]
     async fn test_ws_plain_mode_unchanged() {
-        let url = ws_server(None).await;
+        let url = ws_server().await;
         let mut ws = connect(&url).await.unwrap();
         assert_eq!(next_binary(&mut ws).await.unwrap()[..2], [0, 0]);
         ws.send(WsMessage::Binary(SYNC_STEP_1_EMPTY.to_vec()))
@@ -1839,63 +1908,23 @@ mod test {
         assert!(saw_step_2);
     }
 
-    #[tokio::test]
-    async fn test_ws_encrypted_round_trip() {
-        let b64 = crate::ws_crypto::test::gen_key_b64();
-        let key = WsKey::from_base64_pkcs8(&b64).unwrap();
-        let url = ws_server(Some(&b64)).await;
-        let mut ws = connect(&url).await.unwrap();
-        let (handshake, mut seal, mut open) = crate::ws_crypto::test::client_handshake(&key);
-        ws.send(WsMessage::Binary(handshake)).await.unwrap();
+    use base64::engine::general_purpose::STANDARD;
+    use ws_crypto::{CLIENT_TO_SERVER, SERVER_TO_CLIENT};
 
-        let first = next_binary(&mut ws).await.unwrap();
-        assert_eq!(open.open(&first).unwrap()[..2], [0, 0]);
-        ws.send(WsMessage::Binary(seal.seal(&SYNC_STEP_1_EMPTY)))
-            .await
-            .unwrap();
-        let mut saw_step_2 = false;
-        while let Some(frame) = next_binary(&mut ws).await {
-            if open.open(&frame).unwrap()[..2] == [0, 1] {
-                saw_step_2 = true;
-                break;
-            }
-        }
-        assert!(saw_step_2);
+    const SOCKET_KEY: [u8; 32] = [9; 32];
 
-        // A text frame after the handshake closes the socket.
-        let mut ws = connect(&url).await.unwrap();
-        let (handshake, _, _) = crate::ws_crypto::test::client_handshake(&key);
-        ws.send(WsMessage::Binary(handshake)).await.unwrap();
-        ws.send(WsMessage::Text("hi".into())).await.unwrap();
-        assert!(closes(&mut ws, true).await);
-        let mut ws = connect(&url).await.unwrap();
-        let (handshake, mut seal, _) = crate::ws_crypto::test::client_handshake(&key);
-        ws.send(WsMessage::Binary(handshake)).await.unwrap();
-        ws.send(WsMessage::Binary(seal.seal(&SYNC_STEP_1_EMPTY)))
-            .await
-            .unwrap();
-
-        // A plaintext frame after the handshake closes the socket.
-        ws.send(WsMessage::Binary(SYNC_STEP_1_EMPTY.to_vec()))
-            .await
-            .unwrap();
-        assert!(closes(&mut ws, true).await);
-    }
-
-    #[tokio::test]
-    async fn test_ws_bad_handshake_closes() {
-        let b64 = crate::ws_crypto::test::gen_key_b64();
-        let url = ws_server(Some(&b64)).await;
-        // The second case is a plain client talking to an encrypting server.
-        for first in [vec![0xE0, 0x01, 1, 2, 3], SYNC_STEP_1_EMPTY.to_vec()] {
-            let mut ws = connect(&url).await.unwrap();
-            ws.send(WsMessage::Binary(first)).await.unwrap();
-            assert!(closes(&mut ws, false).await);
-        }
+    /// A wsKey as the encryption service mints it.
+    fn grant(doc_id: &str, sid: &str, exp_in_ms: i64) -> String {
+        let exp = current_time_epoch_millis() as i64 + exp_in_ms;
+        let json = format!(
+            r#"{{"k":"{}","doc":"{doc_id}","sid":"{sid}","exp":{exp}}}"#,
+            STANDARD.encode(SOCKET_KEY)
+        );
+        ws_crypto::test::wrap_grant(&json)
     }
 
     /// A y-sweet with auth, WS encryption and a backend that allows every validate call.
-    async fn bound_server() -> (Arc<Server>, String, String, WsKey) {
+    async fn encrypted_server() -> (Arc<Server>, String, String) {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_url = format!("http://{}", backend.local_addr().unwrap());
         let app = axum::Router::new().route(
@@ -1904,7 +1933,6 @@ mod test {
         );
         tokio::spawn(async move { axum::serve(backend, app).await });
 
-        let b64 = crate::ws_crypto::test::gen_key_b64();
         let server = Server::new(
             None,
             Duration::from_secs(60),
@@ -1923,7 +1951,9 @@ mod test {
         )
         .await
         .unwrap()
-        .with_ws_encryption(Some(WsKey::from_base64_pkcs8(&b64).unwrap()));
+        .with_ws_encryption(Some(
+            WsGrantKey::from_base64(ws_crypto::test::private_key()).unwrap(),
+        ));
         let doc_id = server.create_doc().await.unwrap();
         let server = Arc::new(server);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1933,62 +1963,138 @@ mod test {
         );
         let routes = server.routes();
         tokio::spawn(server.clone().serve_internal(listener, false, routes));
-        (server, doc_id, url, WsKey::from_base64_pkcs8(&b64).unwrap())
+        (server, doc_id, url)
     }
 
-    async fn bound_ticket(server: &Arc<Server>, doc_id: &str, handshake: &[u8]) -> String {
-        let hash = STANDARD.encode(ws_crypto::handshake_hash(handshake));
-        auth_request(server, doc_id, true, Some(hash))
+    async fn encrypted_ticket(server: &Arc<Server>, doc_id: &str, sid: &str) -> String {
+        let token = auth_request(server, doc_id, true, Some(grant(doc_id, sid, 30_000)))
             .await
             .unwrap()
-            .0
-            .token
-            .unwrap()
+            .0;
+        assert!(token.ws_encrypted);
+        token.token.unwrap()
     }
 
     #[tokio::test]
-    async fn test_bound_ticket_opens_only_its_handshake() {
-        let (server, doc_id, url, key) = bound_server().await;
-
-        let (handshake, _, mut open) = crate::ws_crypto::test::client_handshake(&key);
-        let ticket = bound_ticket(&server, &doc_id, &handshake).await;
+    async fn test_ws_encrypted_round_trip() {
+        let (server, doc_id, url) = encrypted_server().await;
+        let ticket = encrypted_ticket(&server, &doc_id, "s1").await;
         let mut ws = connect(&format!("{url}?token={ticket}")).await.unwrap();
-        ws.send(WsMessage::Binary(handshake)).await.unwrap();
+        let mut seal = FrameCipher::new(&SOCKET_KEY, CLIENT_TO_SERVER).unwrap();
+        let mut open = FrameCipher::new(&SOCKET_KEY, SERVER_TO_CLIENT).unwrap();
+
         let first = next_binary(&mut ws).await.unwrap();
         assert_eq!(open.open(&first).unwrap()[..2], [0, 0]);
+        ws.send(WsMessage::Binary(seal.seal(&SYNC_STEP_1_EMPTY)))
+            .await
+            .unwrap();
+        let mut saw_step_2 = false;
+        while let Some(frame) = next_binary(&mut ws).await {
+            if open.open(&frame).unwrap()[..2] == [0, 1] {
+                saw_step_2 = true;
+                break;
+            }
+        }
+        assert!(saw_step_2);
 
-        // Someone who reads the ticket in transit runs their own handshake.
-        let (victim, _, _) = crate::ws_crypto::test::client_handshake(&key);
-        let ticket = bound_ticket(&server, &doc_id, &victim).await;
-        let (own, _, _) = crate::ws_crypto::test::client_handshake(&key);
-        let mut ws = connect(&format!("{url}?token={ticket}")).await.unwrap();
-        ws.send(WsMessage::Binary(own)).await.unwrap();
-        assert!(closes(&mut ws, false).await);
-
-        // Or connects plain.
-        let ticket = bound_ticket(&server, &doc_id, &victim).await;
-        let mut ws = connect(&format!("{url}?token={ticket}")).await.unwrap();
+        // A plaintext frame closes the socket.
         ws.send(WsMessage::Binary(SYNC_STEP_1_EMPTY.to_vec()))
             .await
             .unwrap();
-        assert!(closes(&mut ws, false).await);
+        assert!(closes(&mut ws, true).await);
     }
 
     #[tokio::test]
-    async fn test_required_mode_rejects_unbound_credentials() {
-        let (server, doc_id, url, _) = bound_server().await;
-        for ticket in [true, false] {
-            let token = request_token(&server, &doc_id, ticket).await;
-            assert!(connect(&format!("{url}?token={token}")).await.is_err());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_invalid_handshake_hash_rejected() {
-        let (server, doc_id, _, _) = bound_server().await;
-        for hash in ["not base64!", "AAAA"] {
-            let res = auth_request(&server, &doc_id, true, Some(hash.to_string())).await;
+    async fn test_bad_grants_rejected() {
+        let (server, doc_id, _) = encrypted_server().await;
+        let other_doc = server.create_doc().await.unwrap();
+        for w in [
+            grant(&other_doc, "s1", 30_000),
+            grant(&doc_id, "s1", -1),
+            "not base64!".to_string(),
+        ] {
+            let res = auth_request(&server, &doc_id, true, Some(w)).await;
             assert!(matches!(res, Err(AppError(StatusCode::BAD_REQUEST, _))));
         }
+
+        // One socket key never serves two tickets: their nonces would repeat.
+        let w = grant(&doc_id, "s1", 30_000);
+        assert!(auth_request(&server, &doc_id, true, Some(w.clone()))
+            .await
+            .is_ok());
+        let res = auth_request(&server, &doc_id, true, Some(w)).await;
+        assert!(matches!(res, Err(AppError(StatusCode::BAD_REQUEST, _))));
+    }
+
+    #[tokio::test]
+    async fn test_close_sessions() {
+        let (server, doc_id, url) = encrypted_server().await;
+        let ticket = encrypted_ticket(&server, &doc_id, "s1").await;
+        let unused = encrypted_ticket(&server, &doc_id, "s1").await;
+        let other = encrypted_ticket(&server, &doc_id, "s2").await;
+        let mut ws = connect(&format!("{url}?token={ticket}")).await.unwrap();
+        let mut kept = connect(&format!("{url}?token={other}")).await.unwrap();
+        assert!(next_binary(&mut ws).await.is_some());
+        assert!(next_binary(&mut kept).await.is_some());
+
+        server.close_sessions(&["s1".to_string()]).await;
+        assert!(closes(&mut ws, true).await);
+        assert!(connect(&format!("{url}?token={unused}")).await.is_err());
+        let res = auth_request(&server, &doc_id, true, Some(grant(&doc_id, "s1", 30_000))).await;
+        assert!(matches!(res, Err(AppError(StatusCode::UNAUTHORIZED, _))));
+        assert!(!closes(&mut kept, true).await);
+    }
+
+    #[tokio::test]
+    async fn test_close_sessions_route_needs_server_token() {
+        let (_server, _doc_id, url) = encrypted_server().await;
+        let base = url.replace("ws://", "http://");
+        let route = format!(
+            "{}/internal/close-sessions",
+            &base[..base.find("/d/").unwrap()]
+        );
+        for bearer in [None, Some("wrong")] {
+            let mut req = reqwest::Client::new()
+                .post(&route)
+                .json(&serde_json::json!({ "sids": ["s1"] }));
+            if let Some(b) = bearer {
+                req = req.bearer_auth(b);
+            }
+            assert_eq!(
+                req.send().await.unwrap().status(),
+                reqwest::StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_grant_minted_before_start_rejected() {
+        let (server, doc_id, _url) = encrypted_server().await;
+        let res = auth_request(&server, &doc_id, true, Some(grant(&doc_id, "s1", 1_000))).await;
+        assert!(matches!(res, Err(AppError(StatusCode::BAD_REQUEST, _))));
+    }
+
+    #[tokio::test]
+    async fn test_encrypted_mode_rejects_credentials_without_socket_key() {
+        let (server, doc_id, url) = encrypted_server().await;
+        let res = auth_request(&server, &doc_id, true, None).await;
+        assert!(matches!(res, Err(AppError(StatusCode::CONFLICT, _))));
+        let token = request_token(&server, &doc_id, false).await;
+        assert!(connect(&format!("{url}?token={token}")).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_plain_mode_ignores_ws_key() {
+        let (server, doc_id) = ticket_server().await;
+        let token = auth_request(&server, &doc_id, true, Some(grant(&doc_id, "s1", 30_000)))
+            .await
+            .unwrap()
+            .0;
+        assert!(!token.ws_encrypted);
+        let (_, _, grant) = server
+            .verify_token_or_ticket(&token.token.unwrap(), &doc_id, true)
+            .await
+            .unwrap();
+        assert!(grant.is_none());
     }
 }

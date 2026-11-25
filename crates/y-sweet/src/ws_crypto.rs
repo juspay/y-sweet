@@ -1,74 +1,80 @@
-//! Per-socket frame encryption. The client sends `0xE0 ‖ 0x01 ‖ RSA-OAEP-SHA256(K)` first, then
-//! every frame is AES-256-GCM under K with nonce `direction ‖ u64 counter`, so replay,
-//! reorder and reflection fail to decrypt.
+//! Per-socket frame encryption. The encryption service mints the socket key K and encrypts it to
+//! y-sweet's RSA public key; only y-sweet's private key (`WsGrantKey`) opens it. Every frame is AES-256-GCM under K with nonce
+//! `direction ‖ u64 counter`, so replay, reorder and reflection fail to decrypt.
 use anyhow::{anyhow, bail, Context, Result};
-use aws_lc_rs::{
-    aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM},
-    digest::{digest, SHA256},
-    encoding::AsDer,
-    rsa::{OaepPrivateDecryptingKey, PrivateDecryptingKey, OAEP_SHA256_MGF1SHA256},
+use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+use aws_lc_rs::encoding::AsDer;
+use aws_lc_rs::rsa::{
+    KeySize, OaepPrivateDecryptingKey, PrivateDecryptingKey, OAEP_SHA256_MGF1SHA256,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use serde::Deserialize;
 
-const HANDSHAKE_TAG: u8 = 0xE0;
-const HANDSHAKE_VERSION: u8 = 0x01;
 pub const CLIENT_TO_SERVER: [u8; 4] = [0, 0, 0, 1];
 pub const SERVER_TO_CLIENT: [u8; 4] = [0, 0, 0, 2];
+const WRAP_LABEL: &[u8] = b"ysweet-w/v2";
 
-/// SHA-256 of the whole handshake frame. A ticket can be bound to it.
-pub fn handshake_hash(frame: &[u8]) -> [u8; 32] {
-    digest(&SHA256, frame)
-        .as_ref()
-        .try_into()
-        .expect("SHA-256 is 32 bytes")
+/// A socket key and what it was minted for, unwrapped from the backend's `wsKey`.
+#[derive(Clone, Deserialize)]
+pub struct Grant {
+    #[serde(rename = "k", deserialize_with = "key_from_base64")]
+    pub key: [u8; 32],
+    pub doc: String,
+    pub sid: String,
+    /// Unix milliseconds.
+    pub exp: u64,
 }
 
-pub struct WsKey {
-    key: OaepPrivateDecryptingKey,
-    public_key: String,
+fn key_from_base64<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+    let s = String::deserialize(d)?;
+    STANDARD
+        .decode(s)
+        .ok()
+        .and_then(|k| k.try_into().ok())
+        .ok_or_else(|| serde::de::Error::custom("k must be 32 base64 bytes"))
 }
 
-impl WsKey {
-    /// Takes a base64 PKCS#8 DER RSA private key of at least 2048 bits.
-    pub fn from_base64_pkcs8(b64: &str) -> Result<Self> {
-        let der = STANDARD
-            .decode(b64.split_whitespace().collect::<String>())
-            .context("not base64")?;
-        let private = PrivateDecryptingKey::from_pkcs8(&der)
-            .map_err(|e| anyhow!("not a PKCS#8 RSA private key: {e}"))?;
-        if private.key_size_bits() < 2048 {
-            bail!("RSA key must be at least 2048 bits");
+/// y-sweet's RSA private key. The encryption service holds only its public key.
+pub struct WsGrantKey(OaepPrivateDecryptingKey);
+
+impl WsGrantKey {
+    /// `b64` is the PKCS#8 DER of an RSA key of at least 3072 bits.
+    pub fn from_base64(b64: &str) -> Result<Self> {
+        let raw = STANDARD.decode(b64.trim()).context("not base64")?;
+        let key = PrivateDecryptingKey::from_pkcs8(&raw)
+            .map_err(|_| anyhow!("must be a PKCS#8 RSA private key"))?;
+        if key.key_size_bits() < 3072 {
+            bail!("RSA key must be at least 3072 bits");
         }
-        let spki = private
+        Ok(Self(
+            OaepPrivateDecryptingKey::new(key).map_err(|_| anyhow!("bad RSA key"))?,
+        ))
+    }
+
+    /// A new pair: `(private, public)`, base64 DER. The public half goes to the encryption service.
+    pub fn generate() -> Result<(String, String)> {
+        let key = PrivateDecryptingKey::generate(KeySize::Rsa3072)
+            .map_err(|_| anyhow!("keygen failed"))?;
+        let private = key.as_der().map_err(|_| anyhow!("export failed"))?;
+        let public = key
             .public_key()
             .as_der()
-            .map_err(|_| anyhow!("cannot encode public key"))?;
-        Ok(Self {
-            public_key: STANDARD.encode(spki.as_ref()),
-            key: OaepPrivateDecryptingKey::new(private)
-                .map_err(|_| anyhow!("cannot build OAEP key"))?,
-        })
-    }
-
-    /// Base64 SPKI DER, for WebCrypto `importKey("spki", ...)`.
-    pub fn public_key(&self) -> &str {
-        &self.public_key
-    }
-
-    /// Returns `(sealer, opener)` for the server side of the socket.
-    pub fn handshake(&self, frame: &[u8]) -> Result<(FrameCipher, FrameCipher)> {
-        let [HANDSHAKE_TAG, HANDSHAKE_VERSION, wrapped @ ..] = frame else {
-            bail!("not a handshake frame");
-        };
-        let mut out = vec![0u8; self.key.min_output_size()];
-        let k = self
-            .key
-            .decrypt(&OAEP_SHA256_MGF1SHA256, wrapped, &mut out, None)
-            .map_err(|_| anyhow!("cannot unwrap key"))?;
+            .map_err(|_| anyhow!("export failed"))?;
         Ok((
-            FrameCipher::new(k, SERVER_TO_CLIENT)?,
-            FrameCipher::new(k, CLIENT_TO_SERVER)?,
+            STANDARD.encode(private.as_ref()),
+            STANDARD.encode(public.as_ref()),
         ))
+    }
+
+    /// `w` is base64 RSA-OAEP-SHA256 of the JSON grant, label `ysweet-w/v2`.
+    pub fn unwrap_grant(&self, w: &str) -> Result<Grant> {
+        let raw = STANDARD.decode(w).context("wsKey is not base64")?;
+        let mut buf = vec![0u8; self.0.min_output_size()];
+        let plain = self
+            .0
+            .decrypt(&OAEP_SHA256_MGF1SHA256, &raw, &mut buf, Some(WRAP_LABEL))
+            .map_err(|_| anyhow!("wsKey failed to decrypt"))?;
+        serde_json::from_slice(plain).context("wsKey grant is not valid JSON")
     }
 }
 
@@ -125,36 +131,83 @@ impl FrameCipher {
 #[cfg(test)]
 pub(crate) mod test {
     use super::*;
-    use aws_lc_rs::rsa::{KeySize, OaepPublicEncryptingKey, PublicEncryptingKey};
 
-    pub fn gen_key_b64() -> String {
-        let key = PrivateDecryptingKey::generate(KeySize::Rsa2048).unwrap();
-        STANDARD.encode(key.as_der().unwrap().as_ref())
-    }
-
-    /// Client side: returns the handshake frame plus `(sealer, opener)`.
-    pub fn client_handshake(key: &WsKey) -> (Vec<u8>, FrameCipher, FrameCipher) {
+    fn pair() -> (FrameCipher, FrameCipher, FrameCipher, FrameCipher) {
         let k = [7u8; 32];
-        let spki = STANDARD.decode(key.public_key()).unwrap();
-        let public =
-            OaepPublicEncryptingKey::new(PublicEncryptingKey::from_der(&spki).unwrap()).unwrap();
-        let mut wrapped = vec![0u8; public.ciphertext_size()];
-        let wrapped = public
-            .encrypt(&OAEP_SHA256_MGF1SHA256, &k, &mut wrapped, None)
-            .unwrap();
-        let frame = [&[HANDSHAKE_TAG, HANDSHAKE_VERSION][..], wrapped].concat();
         (
-            frame,
             FrameCipher::new(&k, CLIENT_TO_SERVER).unwrap(),
             FrameCipher::new(&k, SERVER_TO_CLIENT).unwrap(),
+            FrameCipher::new(&k, SERVER_TO_CLIENT).unwrap(),
+            FrameCipher::new(&k, CLIENT_TO_SERVER).unwrap(),
         )
     }
 
-    fn pair() -> (FrameCipher, FrameCipher, FrameCipher, FrameCipher) {
-        let key = WsKey::from_base64_pkcs8(&gen_key_b64()).unwrap();
-        let (frame, c_seal, c_open) = client_handshake(&key);
-        let (s_seal, s_open) = key.handshake(&frame).unwrap();
-        (c_seal, c_open, s_seal, s_open)
+    use aws_lc_rs::rsa::{OaepPublicEncryptingKey, PublicEncryptingKey};
+    use std::sync::OnceLock;
+
+    /// One test pair for the whole run: RSA keygen is slow.
+    pub fn private_key() -> &'static str {
+        static KEY: OnceLock<(String, String)> = OnceLock::new();
+        &KEY.get_or_init(|| WsGrantKey::generate().unwrap()).0
+    }
+
+    fn public_der() -> Vec<u8> {
+        let raw = STANDARD.decode(private_key()).unwrap();
+        let key = PrivateDecryptingKey::from_pkcs8(&raw).unwrap();
+        key.public_key().as_der().unwrap().as_ref().to_vec()
+    }
+
+    /// Encrypts a grant the way the encryption service does.
+    pub fn wrap_grant(grant_json: &str) -> String {
+        let key =
+            OaepPublicEncryptingKey::new(PublicEncryptingKey::from_der(&public_der()).unwrap())
+                .unwrap();
+        let mut out = vec![0u8; key.ciphertext_size()];
+        let w = key
+            .encrypt(
+                &OAEP_SHA256_MGF1SHA256,
+                grant_json.as_bytes(),
+                &mut out,
+                Some(WRAP_LABEL),
+            )
+            .unwrap();
+        STANDARD.encode(w)
+    }
+
+    fn key() -> WsGrantKey {
+        WsGrantKey::from_base64(private_key()).unwrap()
+    }
+
+    #[test]
+    fn unwraps_a_grant() {
+        let grant = r#"{"k":"khBP5Pvmrtt9EqgErVyPfbsI4kCx/W1AJxsHAwbNpCE=","doc":"doc-123","sid":"sid-abc","exp":1700000030000}"#;
+        let g = key().unwrap_grant(&wrap_grant(grant)).unwrap();
+        assert_eq!(
+            STANDARD.encode(g.key),
+            "khBP5Pvmrtt9EqgErVyPfbsI4kCx/W1AJxsHAwbNpCE="
+        );
+        assert_eq!(g.doc, "doc-123");
+        assert_eq!(g.sid, "sid-abc");
+        assert_eq!(g.exp, 1700000030000);
+    }
+
+    #[test]
+    fn rejects_bad_grants() {
+        const GRANT: &str =
+            r#"{"k":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","doc":"d","sid":"s","exp":1}"#;
+        let mut w = STANDARD.decode(wrap_grant(GRANT)).unwrap();
+        assert!(key().unwrap_grant(&STANDARD.encode(&w)).is_ok());
+        *w.last_mut().unwrap() ^= 1;
+        assert!(key().unwrap_grant(&STANDARD.encode(&w)).is_err());
+        let (other, _) = WsGrantKey::generate().unwrap();
+        let other = WsGrantKey::from_base64(&other).unwrap();
+        assert!(other.unwrap_grant(&wrap_grant(GRANT)).is_err());
+        assert!(key().unwrap_grant("short").is_err());
+        assert!(WsGrantKey::from_base64("not base64!").is_err());
+        let small = PrivateDecryptingKey::generate(KeySize::Rsa2048).unwrap();
+        assert!(
+            WsGrantKey::from_base64(&STANDARD.encode(small.as_der().unwrap().as_ref())).is_err()
+        );
     }
 
     #[test]
@@ -197,27 +250,5 @@ pub(crate) mod test {
         *ct.last_mut().unwrap() ^= 1;
         assert!(s_open.open(&ct).is_err());
         assert!(s_open.open(b"short").is_err());
-    }
-
-    #[test]
-    fn rejects_bad_handshake() {
-        let key = WsKey::from_base64_pkcs8(&gen_key_b64()).unwrap();
-        let (frame, _, _) = client_handshake(&key);
-        assert!(key.handshake(&[]).is_err());
-        assert!(key.handshake(&frame[1..]).is_err());
-        let mut bad_version = frame.clone();
-        bad_version[1] = 2;
-        assert!(key.handshake(&bad_version).is_err());
-        let mut tampered = frame.clone();
-        tampered[10] ^= 1;
-        assert!(key.handshake(&tampered).is_err());
-        let other = WsKey::from_base64_pkcs8(&gen_key_b64()).unwrap();
-        assert!(other.handshake(&frame).is_err());
-    }
-
-    #[test]
-    fn rejects_malformed_or_small_keys() {
-        assert!(WsKey::from_base64_pkcs8("not base64!").is_err());
-        assert!(WsKey::from_base64_pkcs8(&STANDARD.encode(b"junk")).is_err());
     }
 }

@@ -31,11 +31,33 @@ struct GcsArgs {
     /// the backend. Requires Y_SWEET_BACKEND_URL and Y_SWEET_SERVER_TOKEN.
     #[clap(long, default_value = "false", env = "Y_SWEET_STORE_ENCRYPTION")]
     store_encryption: bool,
+
+    /// Encryption service base URL. When set (with Y_SWEET_STORE_ENCRYPTION), per-doc keys
+    /// come from it directly and docs are encrypted here instead of with a CSEK. Requires
+    /// Y_SWEET_ENC_KEY.
+    #[clap(long, env = "Y_SWEET_ENC_URL")]
+    enc_url: Option<String>,
+
+    /// Y-Sweet's key for the encryption service's /ysweet routes (its ENC_YSWEET_KEY).
+    #[clap(long, env = "Y_SWEET_ENC_KEY")]
+    enc_key: Option<String>,
 }
 
 impl GcsArgs {
-    fn options(&self, backend_url: Option<&str>, server_token: Option<&str>) -> Result<GcsOptions> {
-        gcs_options(self.store_encryption, backend_url, server_token)
+    fn options(
+        &self,
+        kms: &HashMap<String, String>,
+        backend_url: Option<&str>,
+        server_token: Option<&str>,
+    ) -> Result<GcsOptions> {
+        let enc_key = resolve_secret(kms, "Y_SWEET_ENC_KEY", &self.enc_key, &None)?;
+        gcs_options(
+            self.store_encryption,
+            backend_url,
+            server_token,
+            self.enc_url.as_deref(),
+            enc_key.as_deref(),
+        )
     }
 }
 
@@ -353,7 +375,7 @@ async fn main() -> Result<()> {
             .map(|k| y_sweet::ws_crypto::WsGrantKey::from_base64(&k))
             .transpose()
             .context("Invalid Y_SWEET_WS_GRANT_PRIVATE_KEY")?;
-            let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
+            let gcs = gcs.options(&kms, backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
                 otel_service_name,
@@ -472,7 +494,7 @@ async fn main() -> Result<()> {
         } => {
             let kms = load_kms_secrets().await?;
             let server_token = &resolve_secret(&kms, "Y_SWEET_SERVER_TOKEN", server_token, &None)?;
-            let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
+            let gcs = gcs.options(&kms, backend_url.as_deref(), server_token.as_deref())?;
             let store = get_store_from_opts(store, gcs).await?;
             store.init().await?;
 
@@ -500,7 +522,7 @@ async fn main() -> Result<()> {
         } => {
             let kms = load_kms_secrets().await?;
             let server_token = &resolve_secret(&kms, "Y_SWEET_SERVER_TOKEN", server_token, &None)?;
-            let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
+            let gcs = gcs.options(&kms, backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
                 otel_service_name,

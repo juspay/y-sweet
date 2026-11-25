@@ -1,8 +1,10 @@
+pub mod doc_keys;
 pub mod filesystem;
 pub mod gcs;
 pub mod s3;
 pub mod storage_keys;
 
+use doc_keys::DirectKeyProvider;
 use gcs::GcsOptions;
 use std::sync::Arc;
 use storage_keys::StorageKeyProvider;
@@ -10,11 +12,20 @@ use storage_keys::StorageKeyProvider;
 /// Builds GCS store options from the encryption-related settings. Fails if
 /// encryption is requested without the backend URL and server token needed
 /// to fetch keys, so Y-Sweet never starts up writing docs unencrypted.
+///
+/// With `enc_url` set, per-doc keys come from the encryption service directly and docs are
+/// encrypted by Y-Sweet itself instead of with a CSEK; CSEK docs stay readable.
 pub fn gcs_options(
     store_encryption: bool,
     backend_url: Option<&str>,
     server_token: Option<&str>,
+    enc_url: Option<&str>,
+    enc_key: Option<&str>,
 ) -> anyhow::Result<GcsOptions> {
+    let enc_url = enc_url.filter(|u| !u.is_empty());
+    if enc_url.is_some() && !store_encryption {
+        anyhow::bail!("Y_SWEET_ENC_URL requires Y_SWEET_STORE_ENCRYPTION to be on");
+    }
     let key_provider = if store_encryption {
         let backend_url = backend_url.filter(|u| !u.is_empty()).ok_or_else(|| {
             anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_BACKEND_URL to be set")
@@ -29,7 +40,25 @@ pub fn gcs_options(
     } else {
         None
     };
-    Ok(GcsOptions { key_provider })
+    let direct_keys = match enc_url {
+        Some(enc_url) => {
+            let enc_key = enc_key.filter(|k| !k.is_empty()).ok_or_else(|| {
+                anyhow::anyhow!("Y_SWEET_ENC_URL requires Y_SWEET_ENC_KEY to be set")
+            })?;
+            // store_encryption is on, so the backend URL and token were checked above.
+            Some(Arc::new(DirectKeyProvider::new(
+                enc_url,
+                enc_key.to_owned(),
+                backend_url.unwrap_or_default(),
+                server_token.unwrap_or_default().to_owned(),
+            )?))
+        }
+        None => None,
+    };
+    Ok(GcsOptions {
+        key_provider,
+        direct_keys,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,17 +186,31 @@ mod tests {
 
     #[test]
     fn encryption_requires_backend_url_and_token() {
-        assert!(gcs_options(true, None, Some("t")).is_err());
-        assert!(gcs_options(true, Some("http://b"), None).is_err());
-        assert!(gcs_options(true, Some(""), Some("t")).is_err());
-        assert!(gcs_options(true, Some("http://b"), Some("")).is_err());
-        let opts = gcs_options(true, Some("http://b"), Some("t")).unwrap();
+        assert!(gcs_options(true, None, Some("t"), None, None).is_err());
+        assert!(gcs_options(true, Some("http://b"), None, None, None).is_err());
+        assert!(gcs_options(true, Some(""), Some("t"), None, None).is_err());
+        assert!(gcs_options(true, Some("http://b"), Some(""), None, None).is_err());
+        let opts = gcs_options(true, Some("http://b"), Some("t"), None, None).unwrap();
         assert!(opts.key_provider.is_some());
+        assert!(opts.direct_keys.is_none());
+    }
+
+    #[test]
+    fn direct_keys_need_store_encryption_and_key() {
+        let (b, t, e) = (Some("http://b"), Some("t"), Some("http://e"));
+        assert!(gcs_options(false, b, t, e, Some("k")).is_err());
+        assert!(gcs_options(true, b, t, e, None).is_err());
+        assert!(gcs_options(true, b, t, e, Some("")).is_err());
+        let opts = gcs_options(true, b, t, e, Some("k")).unwrap();
+        assert!(opts.key_provider.is_some());
+        assert!(opts.direct_keys.is_some());
+        let opts = gcs_options(true, b, t, Some(""), None).unwrap();
+        assert!(opts.direct_keys.is_none());
     }
 
     #[test]
     fn encryption_off_needs_no_backend() {
-        let opts = gcs_options(false, None, None).unwrap();
+        let opts = gcs_options(false, None, None, None, None).unwrap();
         assert!(opts.key_provider.is_none());
     }
 

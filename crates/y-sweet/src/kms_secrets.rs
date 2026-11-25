@@ -23,7 +23,7 @@ pub const KMS_CIPHERTEXT_DIR: &str = "/etc/secrets/kms";
 pub const KMS_ENCRYPTED_KEYS: &[&str] = &[
     "Y_SWEET_AUTH",
     "Y_SWEET_SERVER_TOKEN",
-    "Y_SWEET_WS_PRIVATE_KEY",
+    "Y_SWEET_WS_GRANT_PRIVATE_KEY",
 ];
 
 /// Kubernetes' own entries in a Secret volume (`..data`, `..2026_10_30_…`) never match.

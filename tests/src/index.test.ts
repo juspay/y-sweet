@@ -10,6 +10,9 @@ import * as Y from 'yjs'
 import { Server, ServerConfiguration } from './server'
 import { waitForProviderSync, waitForProviderSyncChanges } from './util'
 
+// TODO: sockets now refuse signed tokens. Open them with tickets (`ticket: true` on /auth)
+// so the socket tests pass with auth on.
+
 /**
  * Wraps `createYjsProvider` with a polyfill for `WebSocket` and
  * disables the broadcast channel, which gets in the way of tests

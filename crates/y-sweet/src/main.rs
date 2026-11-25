@@ -113,23 +113,18 @@ enum ServSubcommand {
         #[clap(long, default_value = "30", env = "Y_SWEET_OTEL_PUSH_INTERVAL")]
         otel_push_interval_secs: u64,
 
-        /// Encrypt every WebSocket frame. Requires Y_SWEET_WS_PRIVATE_KEY.
-        #[clap(long, default_value = "false", env = "Y_SWEET_WS_ENCRYPTION")]
-        ws_encryption: bool,
+        /// Base64 PKCS#8 RSA private key (`gen-ws-key`); the encryption service has the public half.
+        /// When set, every browser socket must use a ticket carrying a socket key encrypted to it.
+        #[clap(long, env = "Y_SWEET_WS_GRANT_PRIVATE_KEY", hide_env_values = true)]
+        ws_grant_key: Option<String>,
 
-        /// Base64 PKCS#8 DER RSA private key (>= 2048 bits), used when Y_SWEET_WS_ENCRYPTION is
-        /// on. `openssl genpkey` writes PKCS#1 DER, so convert it:
-        /// `openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 | openssl pkcs8 -topk8 -nocrypt -outform DER | base64`
-        #[clap(long, env = "Y_SWEET_WS_PRIVATE_KEY", hide_env_values = true)]
-        ws_private_key: Option<String>,
-
-        /// Read the WebSocket private key from this file instead of Y_SWEET_WS_PRIVATE_KEY.
+        /// Read Y_SWEET_WS_GRANT_PRIVATE_KEY from this file.
         #[clap(
             long,
-            env = "Y_SWEET_WS_PRIVATE_KEY_FILE",
-            conflicts_with = "ws_private_key"
+            env = "Y_SWEET_WS_GRANT_PRIVATE_KEY_FILE",
+            conflicts_with = "ws_grant_key"
         )]
-        ws_private_key_file: Option<PathBuf>,
+        ws_grant_key_file: Option<PathBuf>,
 
         #[clap(flatten)]
         gcs: GcsArgs,
@@ -139,6 +134,10 @@ enum ServSubcommand {
         #[clap(long)]
         json: bool,
     },
+
+    /// Print a new socket grant key pair: the private key for Y_SWEET_WS_GRANT_PRIVATE_KEY, the
+    /// public key for the encryption service.
+    GenWsKey,
 
     /// Convert from a YDoc v1 update format to a .ysweet file.
     /// The YDoc update should be passed in via stdin.
@@ -332,9 +331,8 @@ async fn main() -> Result<()> {
             otel_endpoint,
             otel_service_name,
             otel_push_interval_secs,
-            ws_encryption,
-            ws_private_key,
-            ws_private_key_file,
+            ws_grant_key,
+            ws_grant_key_file,
             gcs,
         } => {
             let kms = load_kms_secrets().await?;
@@ -345,17 +343,30 @@ async fn main() -> Result<()> {
                 server_token,
                 server_token_file,
             )?;
-            let ws_private_key = &resolve_secret(
+            let ws_grant_key = resolve_secret(
                 &kms,
-                "Y_SWEET_WS_PRIVATE_KEY",
-                ws_private_key,
-                ws_private_key_file,
-            )?;
+                "Y_SWEET_WS_GRANT_PRIVATE_KEY",
+                ws_grant_key,
+                ws_grant_key_file,
+            )?
+            .filter(|k| !k.is_empty())
+            .map(|k| y_sweet::ws_crypto::WsGrantKey::from_base64(&k))
+            .transpose()
+            .context("Invalid Y_SWEET_WS_GRANT_PRIVATE_KEY")?;
             let gcs = gcs.options(backend_url.as_deref(), server_token.as_deref())?;
             let meter_provider = y_sweet::otel::init_meter_provider(
                 otel_endpoint.as_deref(),
                 otel_service_name,
                 std::time::Duration::from_secs(*otel_push_interval_secs),
+            );
+            if ws_grant_key.is_some() && auth.is_none() {
+                anyhow::bail!(
+                    "Y_SWEET_WS_GRANT_PRIVATE_KEY needs Y_SWEET_AUTH: sockets need tickets"
+                );
+            }
+            tracing::info!(
+                "WebSocket frame encryption: {}",
+                if ws_grant_key.is_some() { "on" } else { "off" }
             );
             let auth = if let Some(auth) = auth {
                 Some(Authenticator::new(auth)?)
@@ -388,19 +399,6 @@ async fn main() -> Result<()> {
                 print_server_url(auth.as_ref(), url_prefix.as_ref(), addr);
             }
 
-            let ws_key = if *ws_encryption {
-                let key = ws_private_key
-                    .as_deref()
-                    .filter(|k| !k.is_empty())
-                    .context("Y_SWEET_WS_ENCRYPTION requires Y_SWEET_WS_PRIVATE_KEY to be set")?;
-                Some(
-                    y_sweet::ws_crypto::WsKey::from_base64_pkcs8(key)
-                        .context("Invalid Y_SWEET_WS_PRIVATE_KEY")?,
-                )
-            } else {
-                None
-            };
-
             let token = CancellationToken::new();
 
             let server = y_sweet::server::Server::new(
@@ -420,7 +418,7 @@ async fn main() -> Result<()> {
                 std::time::Duration::from_millis(*validate_retry_delay_ms),
             )
             .await?
-            .with_ws_encryption(ws_key);
+            .with_ws_encryption(ws_grant_key);
 
             let prod = *prod;
             let handle = tokio::spawn(async move {
@@ -455,6 +453,15 @@ async fn main() -> Result<()> {
             } else {
                 print_auth_message(&auth);
             }
+        }
+        ServSubcommand::GenWsKey => {
+            let (private_key, public_key) = y_sweet::ws_crypto::WsGrantKey::generate()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &json!({ "private_key": private_key, "public_key": public_key })
+                )?
+            );
         }
         ServSubcommand::ConvertFromUpdate {
             store,

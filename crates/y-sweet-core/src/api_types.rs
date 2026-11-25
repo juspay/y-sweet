@@ -31,10 +31,9 @@ pub struct AuthDocRequest {
     /// Return a single-use WebSocket ticket instead of a signed token.
     #[serde(default)]
     pub ticket: bool,
-    /// Base64 SHA-256 of the client's handshake frame. The ticket then only opens a socket
-    /// whose first frame has this hash.
-    #[serde(default, rename = "wsHandshakeHash")]
-    pub ws_handshake_hash: Option<String>,
+    /// The socket key from the encryption service, encrypted to y-sweet's grant public key.
+    #[serde(default, rename = "wsKey")]
+    pub ws_key: Option<String>,
 }
 
 impl Default for AuthDocRequest {
@@ -44,7 +43,7 @@ impl Default for AuthDocRequest {
             user_id: None,
             valid_for_seconds: None,
             ticket: false,
-            ws_handshake_hash: None,
+            ws_key: None,
         }
     }
 }
@@ -71,13 +70,9 @@ pub struct ClientToken {
     #[serde(rename = "authorization")]
     pub authorization: Authorization,
 
-    /// Base64 SPKI RSA key for WebSocket frame encryption, when the server has one.
-    #[serde(
-        rename = "wsPublicKey",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
-    pub ws_public_key: Option<String>,
+    /// The ticket opens a socket whose frames are encrypted under the key in `wsKey`.
+    #[serde(rename = "wsEncrypted", default)]
+    pub ws_encrypted: bool,
 }
 
 #[derive(Deserialize, Debug)]

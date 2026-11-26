@@ -1,11 +1,11 @@
-//! Per-doc keys from the encryption service directly, and doc encryption in Y-Sweet itself.
+//! Docs encrypted by Y-Sweet itself with their per-doc key.
 //!
 //! Each doc has its own 32-byte key, issued by the encryption service and wrapped under the
-//! doc's workspace storage key; the wrapped form is kept in the object's metadata
-//! (`enc-wdek`), as with CSEK docs. Y-Sweet asks the service's `/ysweet/storage/generate-key`
-//! for a new doc's key and `/ysweet/storage/unwrap-key` for an existing one, with its own key
-//! (`x-ysweet-key`), so no key passes through the backend. The backend is asked only which
-//! workspace owns a new doc (`POST /internal/ysweet/doc-workspace`, server-token auth).
+//! doc's workspace storage key; the wrapped form is kept in the object's metadata (`enc-wdek`),
+//! as with CSEK docs. Y-Sweet gets the key through the backend's storage-key route with
+//! `grant`: the encryption service seals it to Y-Sweet's RSA public key (the canvas socket
+//! grant key, under its own label), so the backend relays it without being able to read it.
+//! The grant names the doc and the wrapped key it belongs to (`doc_key_from_grant` checks both).
 //!
 //! The doc is then encrypted here, and GCS stores only ciphertext:
 //!
@@ -14,140 +14,41 @@
 //! The doc id in the AAD keeps one doc's object from being served as another's. Key material
 //! and doc bytes must never be logged.
 
-use super::storage_keys::{decode_key, DocKey, StorageKeyError};
+use crate::ws_crypto::WsGrantKey;
 use aws_lc_rs::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
+use aws_lc_rs::digest::{digest, SHA256};
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
-use serde::Deserialize;
-use std::time::Duration;
-
-const GENERATE_PATH: &str = "/ysweet/storage/generate-key";
-const UNWRAP_PATH: &str = "/ysweet/storage/unwrap-key";
-const DOC_WORKSPACE_PATH: &str = "/internal/ysweet/doc-workspace";
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+use base64::{engine::general_purpose::STANDARD, Engine};
 
 /// Start of every doc this module encrypts.
 pub const MAGIC: &[u8; 4] = b"XYD1";
 const TAG_LEN: usize = 16;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GenerateResponse {
-    key: String,
-    wrapped_key: String,
-}
-
-#[derive(Deserialize)]
-struct UnwrapResponse {
-    key: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DocWorkspaceResponse {
-    workspace_id: String,
-}
-
-pub struct DirectKeyProvider {
-    client: reqwest::Client,
-    enc_url: String,
-    enc_key: String,
-    backend_url: String,
-    server_token: String,
-}
-
-impl DirectKeyProvider {
-    pub fn new(
-        enc_url: &str,
-        enc_key: String,
-        backend_url: &str,
-        server_token: String,
-    ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()?;
-        Ok(Self {
-            client,
-            enc_url: enc_url.trim_end_matches('/').to_string(),
-            enc_key,
-            backend_url: backend_url.trim_end_matches('/').to_string(),
-            server_token,
-        })
+/// The doc key in `grant`, after checking it was sealed for `doc_id` and for `wrapped_key`
+/// (the `enc-wdek` stored beside the doc) and has not expired.
+pub fn doc_key_from_grant(
+    grant_key: &WsGrantKey,
+    grant: &str,
+    doc_id: &str,
+    wrapped_key: &str,
+) -> Result<[u8; 32], DocCryptoError> {
+    let g = grant_key
+        .unwrap_doc_key_grant(grant)
+        .map_err(|_| DocCryptoError::Grant("does not open"))?;
+    if g.doc != doc_id {
+        return Err(DocCryptoError::Grant("is for another doc"));
     }
-
-    /// A new key for `doc_id`, wrapped under its workspace's storage key.
-    pub async fn generate(&self, doc_id: &str) -> Result<DocKey, StorageKeyError> {
-        let workspace = self.workspace(doc_id).await?;
-        let resp: GenerateResponse = self
-            .post_enc(
-                GENERATE_PATH,
-                serde_json::json!({ "workspaceId": workspace.workspace_id }),
-            )
-            .await?;
-        if resp.wrapped_key.is_empty() {
-            return Err(StorageKeyError::Malformed("empty wrappedKey"));
-        }
-        Ok(DocKey {
-            key: decode_key(&resp.key)?,
-            wrapped_key: resp.wrapped_key,
-        })
+    if g.wk != STANDARD.encode(digest(&SHA256, wrapped_key.as_bytes()).as_ref()) {
+        return Err(DocCryptoError::Grant("is for another wrapped key"));
     }
-
-    /// The key in `wrapped_key` (an object's `enc-wdek`).
-    pub async fn unwrap(&self, wrapped_key: &str) -> Result<[u8; 32], StorageKeyError> {
-        let resp: UnwrapResponse = self
-            .post_enc(
-                UNWRAP_PATH,
-                serde_json::json!({ "wrappedKey": wrapped_key }),
-            )
-            .await?;
-        decode_key(&resp.key)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(u64::MAX);
+    if g.exp < now {
+        return Err(DocCryptoError::Grant("has expired"));
     }
-
-    async fn workspace(&self, doc_id: &str) -> Result<DocWorkspaceResponse, StorageKeyError> {
-        let resp = self
-            .client
-            .post(format!("{}{}", self.backend_url, DOC_WORKSPACE_PATH))
-            .bearer_auth(&self.server_token)
-            .json(&serde_json::json!({ "docId": doc_id }))
-            .send()
-            .await
-            .map_err(|e| StorageKeyError::Request(e.without_url().to_string()))?;
-        read_json(resp).await.and_then(|r: DocWorkspaceResponse| {
-            if r.workspace_id.is_empty() {
-                Err(StorageKeyError::Malformed("empty workspaceId"))
-            } else {
-                Ok(r)
-            }
-        })
-    }
-
-    async fn post_enc<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-        body: serde_json::Value,
-    ) -> Result<T, StorageKeyError> {
-        let resp = self
-            .client
-            .post(format!("{}{}", self.enc_url, path))
-            .header("x-ysweet-key", &self.enc_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| StorageKeyError::Request(e.without_url().to_string()))?;
-        read_json(resp).await
-    }
-}
-
-async fn read_json<T: serde::de::DeserializeOwned>(
-    resp: reqwest::Response,
-) -> Result<T, StorageKeyError> {
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(StorageKeyError::Status(status.as_u16()));
-    }
-    resp.json::<T>()
-        .await
-        .map_err(|_| StorageKeyError::Malformed("invalid JSON body"))
+    Ok(g.key)
 }
 
 /// Errors deliberately carry no key material or doc bytes.
@@ -159,6 +60,8 @@ pub enum DocCryptoError {
     NotEncrypted,
     #[error("stored doc failed to decrypt")]
     Open,
+    #[error("doc key grant {0}")]
+    Grant(&'static str),
 }
 
 fn doc_aad(doc_id: &str) -> Vec<u8> {
@@ -241,6 +144,31 @@ mod tests {
             seal_doc(&KEY, "doc-1", b"same").unwrap(),
             seal_doc(&KEY, "doc-1", b"same").unwrap()
         );
+    }
+
+    fn grant(doc: &str, wrapped: &str, exp: u64) -> String {
+        let wk = STANDARD.encode(digest(&SHA256, wrapped.as_bytes()).as_ref());
+        crate::ws_crypto::test::wrap_doc_key_grant(&format!(
+            r#"{{"k":"{}","doc":"{doc}","wk":"{wk}","exp":{exp}}}"#,
+            STANDARD.encode(KEY)
+        ))
+    }
+
+    #[test]
+    fn grant_must_match_doc_wrapped_key_and_time() {
+        let gk = WsGrantKey::from_base64(crate::ws_crypto::test::private_key()).unwrap();
+        let later = u64::MAX / 2;
+        let w = "ENC:v1|ws|abc";
+        assert_eq!(
+            doc_key_from_grant(&gk, &grant("doc-1", w, later), "doc-1", w).unwrap(),
+            KEY
+        );
+        assert!(doc_key_from_grant(&gk, &grant("doc-2", w, later), "doc-1", w).is_err());
+        assert!(
+            doc_key_from_grant(&gk, &grant("doc-1", "ENC:v1|ws|other", later), "doc-1", w).is_err()
+        );
+        assert!(doc_key_from_grant(&gk, &grant("doc-1", w, 1), "doc-1", w).is_err());
+        assert!(doc_key_from_grant(&gk, "not-a-grant", "doc-1", w).is_err());
     }
 
     #[test]

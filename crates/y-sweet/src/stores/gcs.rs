@@ -1,5 +1,6 @@
-use super::doc_keys::{is_encrypted_doc, open_doc, seal_doc, DirectKeyProvider};
+use super::doc_keys::{doc_key_from_grant, is_encrypted_doc, open_doc, seal_doc};
 use super::storage_keys::{DocKey, StorageKeyProvider};
+use crate::ws_crypto::WsGrantKey;
 use async_trait::async_trait;
 use google_cloud_storage::client::{Storage, StorageControl};
 use google_cloud_storage::model::Object;
@@ -103,14 +104,15 @@ fn encryption_error(op: &str, doc_id: &str, err: impl std::fmt::Display) -> Stor
 pub struct GcsOptions {
     /// When set, every doc is encrypted with a per-doc CSEK.
     pub key_provider: Option<Arc<StorageKeyProvider>>,
-    /// When set (with `key_provider`), per-doc keys come from the encryption service
-    /// directly and docs are encrypted here (`enc-v: 3`) instead of with a CSEK.
-    pub direct_keys: Option<Arc<DirectKeyProvider>>,
+    /// When set (with `key_provider`), per-doc keys come sealed to this key (the canvas socket
+    /// grant key) and docs are encrypted here (`enc-v: 3`) instead of with a CSEK.
+    pub grant_key: Option<Arc<WsGrantKey>>,
 }
 
 struct Encryption {
     provider: Arc<StorageKeyProvider>,
-    direct: Option<Arc<DirectKeyProvider>>,
+    /// Encrypt docs here, with keys sealed to this key; `None`: CSEK.
+    local: Option<Arc<WsGrantKey>>,
     /// `doc_id -> key`. Only holds keys for objects that are (or are about to
     /// be) written encrypted; never for an unencrypted object.
     keys: Cache<String, DocKey>,
@@ -137,10 +139,10 @@ impl GcsStore {
     ) -> anyhow::Result<Self> {
         let storage = Storage::builder().build().await?;
         let control = StorageControl::builder().build().await?;
-        let direct = options.direct_keys;
+        let local = options.grant_key;
         let encryption = options.key_provider.map(|provider| Encryption {
             provider,
-            direct,
+            local,
             keys: Cache::builder()
                 .max_capacity(KEY_CACHE_MAX_ENTRIES)
                 .time_to_idle(KEY_CACHE_IDLE)
@@ -248,11 +250,22 @@ impl GcsStore {
         doc_id: &str,
         wrapped_key: &str,
     ) -> Result<DocKey> {
-        let key = match &enc.direct {
-            Some(direct) => direct.unwrap(wrapped_key).await,
-            None => enc.provider.unwrap(doc_id, wrapped_key).await,
-        }
-        .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?;
+        let key = match &enc.local {
+            Some(grant_key) => {
+                let grant = enc
+                    .provider
+                    .unwrap_sealed(doc_id, wrapped_key)
+                    .await
+                    .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?;
+                doc_key_from_grant(grant_key, &grant, doc_id, wrapped_key)
+                    .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?
+            }
+            None => enc
+                .provider
+                .unwrap(doc_id, wrapped_key)
+                .await
+                .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?,
+        };
         Ok(DocKey {
             key,
             wrapped_key: wrapped_key.to_string(),
@@ -274,11 +287,23 @@ impl GcsStore {
         let existing = self.object_metadata(object_key).await?;
         let doc_key = match existing.as_ref().and_then(wrapped_key_of) {
             Some(wrapped_key) => self.unwrap_key(enc, doc_id, wrapped_key).await?,
-            None => match &enc.direct {
-                Some(direct) => direct.generate(doc_id).await,
-                None => enc.provider.generate(doc_id).await,
-            }
-            .map_err(|e| encryption_error("generate storage key", doc_id, e))?,
+            None => match &enc.local {
+                Some(grant_key) => {
+                    let (wrapped_key, grant) = enc
+                        .provider
+                        .generate_sealed(doc_id)
+                        .await
+                        .map_err(|e| encryption_error("generate storage key", doc_id, e))?;
+                    let key = doc_key_from_grant(grant_key, &grant, doc_id, &wrapped_key)
+                        .map_err(|e| encryption_error("generate storage key", doc_id, e))?;
+                    DocKey { key, wrapped_key }
+                }
+                None => enc
+                    .provider
+                    .generate(doc_id)
+                    .await
+                    .map_err(|e| encryption_error("generate storage key", doc_id, e))?,
+            },
         };
         enc.keys.insert(doc_id.to_string(), doc_key.clone()).await;
         Ok(doc_key)
@@ -346,7 +371,7 @@ impl Store for GcsStore {
                     ))
                 })?;
                 let doc_key = self.key_for_write(enc, doc_id, &object_key).await?;
-                if enc.direct.is_some() {
+                if enc.local.is_some() {
                     // Encrypted here: GCS stores only ciphertext and never sees the key.
                     let sealed = seal_doc(&doc_key.key, doc_id, &value)
                         .map_err(|e| encryption_error("encrypt doc", doc_id, e))?;

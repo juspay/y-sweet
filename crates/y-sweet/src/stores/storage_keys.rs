@@ -1,9 +1,11 @@
-//! Per-doc customer-supplied encryption keys (CSEK), issued by the backend.
+//! Per-doc storage keys, issued through the backend.
 //!
 //! Y-Sweet never talks to the encryption service directly. It asks the
 //! backend's `POST /internal/ysweet/storage-key` (server-token auth) either to
 //! generate a fresh key for a doc, or to unwrap a key stored in the object's
-//! metadata. Key material must never be logged.
+//! metadata. As a CSEK the key comes back raw; with `grant` (docs Y-Sweet
+//! encrypts itself, `doc_keys`) it comes back sealed to Y-Sweet's public key, so
+//! the backend relaying it cannot read it. Key material must never be logged.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
@@ -35,6 +37,13 @@ struct GenerateResponse {
 #[derive(Deserialize)]
 struct UnwrapResponse {
     key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SealedResponse {
+    wrapped_key: Option<String>,
+    grant: Option<String>,
 }
 
 /// Errors deliberately carry no key material.
@@ -89,6 +98,32 @@ impl StorageKeyProvider {
             .post(serde_json::json!({ "docId": doc_id, "wrappedKey": wrapped_key }))
             .await?;
         decode_key(&resp.key)
+    }
+
+    /// A new key for `doc_id`, sealed to y-sweet's public key by the encryption service: the
+    /// backend relays it and cannot read it. `(wrapped_key, grant)`.
+    pub async fn generate_sealed(&self, doc_id: &str) -> Result<(String, String), StorageKeyError> {
+        let resp: SealedResponse = self
+            .post(serde_json::json!({ "docId": doc_id, "grant": true }))
+            .await?;
+        match (resp.wrapped_key, resp.grant) {
+            (Some(w), Some(g)) if !w.is_empty() && !g.is_empty() => Ok((w, g)),
+            _ => Err(StorageKeyError::Malformed("missing wrappedKey or grant")),
+        }
+    }
+
+    /// The key in `wrapped_key` (an object's `enc-wdek`), sealed to y-sweet's public key.
+    pub async fn unwrap_sealed(
+        &self,
+        doc_id: &str,
+        wrapped_key: &str,
+    ) -> Result<String, StorageKeyError> {
+        let resp: SealedResponse = self
+            .post(serde_json::json!({ "docId": doc_id, "wrappedKey": wrapped_key, "grant": true }))
+            .await?;
+        resp.grant
+            .filter(|g| !g.is_empty())
+            .ok_or(StorageKeyError::Malformed("missing grant"))
     }
 
     async fn post<T: serde::de::DeserializeOwned>(

@@ -13,6 +13,8 @@ use serde::Deserialize;
 pub const CLIENT_TO_SERVER: [u8; 4] = [0, 0, 0, 1];
 pub const SERVER_TO_CLIENT: [u8; 4] = [0, 0, 0, 2];
 const WRAP_LABEL: &[u8] = b"ysweet-w/v2";
+/// A canvas doc's storage key, sealed by the encryption service; never opens as a socket grant.
+const DOC_KEY_LABEL: &[u8] = b"ysweet-dek/v1";
 
 /// A socket key and what it was minted for, unwrapped from the backend's `wsKey`.
 #[derive(Clone, Deserialize)]
@@ -21,6 +23,18 @@ pub struct Grant {
     pub key: [u8; 32],
     pub doc: String,
     pub sid: String,
+    /// Unix milliseconds.
+    pub exp: u64,
+}
+
+/// A doc's storage key and what it was sealed for, unwrapped from the backend's `grant`.
+#[derive(Clone, Deserialize)]
+pub struct DocKeyGrant {
+    #[serde(rename = "k", deserialize_with = "key_from_base64")]
+    pub key: [u8; 32],
+    pub doc: String,
+    /// Base64 SHA-256 of the wrapped key stored beside the doc.
+    pub wk: String,
     /// Unix milliseconds.
     pub exp: u64,
 }
@@ -75,6 +89,17 @@ impl WsGrantKey {
             .decrypt(&OAEP_SHA256_MGF1SHA256, &raw, &mut buf, Some(WRAP_LABEL))
             .map_err(|_| anyhow!("wsKey failed to decrypt"))?;
         serde_json::from_slice(plain).context("wsKey grant is not valid JSON")
+    }
+
+    /// `w` is base64 RSA-OAEP-SHA256 of the JSON doc key grant, label `ysweet-dek/v1`.
+    pub fn unwrap_doc_key_grant(&self, w: &str) -> Result<DocKeyGrant> {
+        let raw = STANDARD.decode(w).context("doc key grant is not base64")?;
+        let mut buf = vec![0u8; self.0.min_output_size()];
+        let plain = self
+            .0
+            .decrypt(&OAEP_SHA256_MGF1SHA256, &raw, &mut buf, Some(DOC_KEY_LABEL))
+            .map_err(|_| anyhow!("doc key grant failed to decrypt"))?;
+        serde_json::from_slice(plain).context("doc key grant is not valid JSON")
     }
 }
 
@@ -157,8 +182,17 @@ pub(crate) mod test {
         key.public_key().as_der().unwrap().as_ref().to_vec()
     }
 
+    /// Encrypts a doc key grant the way the encryption service does.
+    pub fn wrap_doc_key_grant(grant_json: &str) -> String {
+        wrap_with(grant_json, DOC_KEY_LABEL)
+    }
+
     /// Encrypts a grant the way the encryption service does.
     pub fn wrap_grant(grant_json: &str) -> String {
+        wrap_with(grant_json, WRAP_LABEL)
+    }
+
+    fn wrap_with(grant_json: &str, label: &[u8]) -> String {
         let key =
             OaepPublicEncryptingKey::new(PublicEncryptingKey::from_der(&public_der()).unwrap())
                 .unwrap();
@@ -168,7 +202,7 @@ pub(crate) mod test {
                 &OAEP_SHA256_MGF1SHA256,
                 grant_json.as_bytes(),
                 &mut out,
-                Some(WRAP_LABEL),
+                Some(label),
             )
             .unwrap();
         STANDARD.encode(w)
@@ -176,6 +210,21 @@ pub(crate) mod test {
 
     fn key() -> WsGrantKey {
         WsGrantKey::from_base64(private_key()).unwrap()
+    }
+
+    #[test]
+    fn doc_key_grants_and_socket_grants_never_cross() {
+        let grant = r#"{"k":"khBP5Pvmrtt9EqgErVyPfbsI4kCx/W1AJxsHAwbNpCE=","doc":"doc-1","wk":"d2s=","exp":1700000060000}"#;
+        let g = key()
+            .unwrap_doc_key_grant(&wrap_doc_key_grant(grant))
+            .unwrap();
+        assert_eq!(
+            (g.doc.as_str(), g.wk.as_str(), g.exp),
+            ("doc-1", "d2s=", 1700000060000)
+        );
+        assert!(key().unwrap_grant(&wrap_doc_key_grant(grant)).is_err());
+        let socket = r#"{"k":"khBP5Pvmrtt9EqgErVyPfbsI4kCx/W1AJxsHAwbNpCE=","doc":"doc-1","sid":"s","exp":1}"#;
+        assert!(key().unwrap_doc_key_grant(&wrap_grant(socket)).is_err());
     }
 
     #[test]

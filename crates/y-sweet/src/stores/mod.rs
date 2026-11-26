@@ -4,7 +4,8 @@ pub mod gcs;
 pub mod s3;
 pub mod storage_keys;
 
-use doc_keys::DirectKeyProvider;
+use crate::ws_crypto::WsGrantKey;
+use anyhow::Context;
 use gcs::GcsOptions;
 use std::sync::Arc;
 use storage_keys::StorageKeyProvider;
@@ -13,18 +14,18 @@ use storage_keys::StorageKeyProvider;
 /// encryption is requested without the backend URL and server token needed
 /// to fetch keys, so Y-Sweet never starts up writing docs unencrypted.
 ///
-/// With `enc_url` set, per-doc keys come from the encryption service directly and docs are
-/// encrypted by Y-Sweet itself instead of with a CSEK; CSEK docs stay readable.
+/// With `local_encryption`, docs are encrypted by Y-Sweet itself with per-doc keys that the
+/// backend relays sealed to `grant_key` (the canvas socket grant private key) instead of with a
+/// CSEK; CSEK docs stay readable.
 pub fn gcs_options(
     store_encryption: bool,
     backend_url: Option<&str>,
     server_token: Option<&str>,
-    enc_url: Option<&str>,
-    enc_key: Option<&str>,
+    local_encryption: bool,
+    grant_key: Option<&str>,
 ) -> anyhow::Result<GcsOptions> {
-    let enc_url = enc_url.filter(|u| !u.is_empty());
-    if enc_url.is_some() && !store_encryption {
-        anyhow::bail!("Y_SWEET_ENC_URL requires Y_SWEET_STORE_ENCRYPTION to be on");
+    if local_encryption && !store_encryption {
+        anyhow::bail!("Y_SWEET_STORE_LOCAL_ENCRYPTION requires Y_SWEET_STORE_ENCRYPTION to be on");
     }
     let key_provider = if store_encryption {
         let backend_url = backend_url.filter(|u| !u.is_empty()).ok_or_else(|| {
@@ -40,24 +41,21 @@ pub fn gcs_options(
     } else {
         None
     };
-    let direct_keys = match enc_url {
-        Some(enc_url) => {
-            let enc_key = enc_key.filter(|k| !k.is_empty()).ok_or_else(|| {
-                anyhow::anyhow!("Y_SWEET_ENC_URL requires Y_SWEET_ENC_KEY to be set")
-            })?;
-            // store_encryption is on, so the backend URL and token were checked above.
-            Some(Arc::new(DirectKeyProvider::new(
-                enc_url,
-                enc_key.to_owned(),
-                backend_url.unwrap_or_default(),
-                server_token.unwrap_or_default().to_owned(),
-            )?))
-        }
-        None => None,
+    let grant_key = if local_encryption {
+        let raw = grant_key.filter(|k| !k.is_empty()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Y_SWEET_STORE_LOCAL_ENCRYPTION requires Y_SWEET_WS_GRANT_PRIVATE_KEY to be set"
+            )
+        })?;
+        Some(Arc::new(
+            WsGrantKey::from_base64(raw).context("Invalid Y_SWEET_WS_GRANT_PRIVATE_KEY")?,
+        ))
+    } else {
+        None
     };
     Ok(GcsOptions {
         key_provider,
-        direct_keys,
+        grant_key,
     })
 }
 
@@ -186,31 +184,34 @@ mod tests {
 
     #[test]
     fn encryption_requires_backend_url_and_token() {
-        assert!(gcs_options(true, None, Some("t"), None, None).is_err());
-        assert!(gcs_options(true, Some("http://b"), None, None, None).is_err());
-        assert!(gcs_options(true, Some(""), Some("t"), None, None).is_err());
-        assert!(gcs_options(true, Some("http://b"), Some(""), None, None).is_err());
-        let opts = gcs_options(true, Some("http://b"), Some("t"), None, None).unwrap();
+        assert!(gcs_options(true, None, Some("t"), false, None).is_err());
+        assert!(gcs_options(true, Some("http://b"), None, false, None).is_err());
+        assert!(gcs_options(true, Some(""), Some("t"), false, None).is_err());
+        assert!(gcs_options(true, Some("http://b"), Some(""), false, None).is_err());
+        let opts = gcs_options(true, Some("http://b"), Some("t"), false, None).unwrap();
         assert!(opts.key_provider.is_some());
-        assert!(opts.direct_keys.is_none());
+        assert!(opts.grant_key.is_none());
     }
 
     #[test]
-    fn direct_keys_need_store_encryption_and_key() {
-        let (b, t, e) = (Some("http://b"), Some("t"), Some("http://e"));
-        assert!(gcs_options(false, b, t, e, Some("k")).is_err());
-        assert!(gcs_options(true, b, t, e, None).is_err());
-        assert!(gcs_options(true, b, t, e, Some("")).is_err());
-        let opts = gcs_options(true, b, t, e, Some("k")).unwrap();
+    fn local_encryption_needs_store_encryption_and_grant_key() {
+        let (b, t) = (Some("http://b"), Some("t"));
+        let key = Some(crate::ws_crypto::test::private_key());
+        assert!(gcs_options(false, b, t, true, key).is_err());
+        assert!(gcs_options(true, b, t, true, None).is_err());
+        assert!(gcs_options(true, b, t, true, Some("")).is_err());
+        assert!(gcs_options(true, b, t, true, Some("not-a-key")).is_err());
+        let opts = gcs_options(true, b, t, true, key).unwrap();
         assert!(opts.key_provider.is_some());
-        assert!(opts.direct_keys.is_some());
-        let opts = gcs_options(true, b, t, Some(""), None).unwrap();
-        assert!(opts.direct_keys.is_none());
+        assert!(opts.grant_key.is_some());
+        // The grant key alone (socket encryption) does not turn local encryption on.
+        let socket_only = gcs_options(true, b, t, false, key).unwrap();
+        assert!(socket_only.grant_key.is_none());
     }
 
     #[test]
     fn encryption_off_needs_no_backend() {
-        let opts = gcs_options(false, None, None, None, None).unwrap();
+        let opts = gcs_options(false, None, None, false, None).unwrap();
         assert!(opts.key_provider.is_none());
     }
 

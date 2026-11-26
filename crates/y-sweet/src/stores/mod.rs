@@ -27,6 +27,9 @@ pub fn gcs_options(
     if local_encryption && !store_encryption {
         anyhow::bail!("Y_SWEET_STORE_LOCAL_ENCRYPTION requires Y_SWEET_STORE_ENCRYPTION to be on");
     }
+    if local_encryption && !xyne_doc_crypto::AVAILABLE {
+        anyhow::bail!("Y_SWEET_STORE_LOCAL_ENCRYPTION is not supported by this build");
+    }
     let key_provider = if store_encryption {
         let backend_url = backend_url.filter(|u| !u.is_empty()).ok_or_else(|| {
             anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_BACKEND_URL to be set")
@@ -197,6 +200,10 @@ mod tests {
     fn local_encryption_needs_store_encryption_and_grant_key() {
         let (b, t) = (Some("http://b"), Some("t"));
         let key = Some(crate::ws_crypto::test::private_key());
+        if !xyne_doc_crypto::AVAILABLE {
+            assert!(gcs_options(true, b, t, true, key).is_err());
+            return;
+        }
         assert!(gcs_options(false, b, t, true, key).is_err());
         assert!(gcs_options(true, b, t, true, None).is_err());
         assert!(gcs_options(true, b, t, true, Some("")).is_err());

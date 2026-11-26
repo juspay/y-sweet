@@ -1,0 +1,13 @@
+[package]
+name = "xyne-doc-crypto"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Canvas doc encryption interface (stub: not available in this build)."
+
+[dependencies]
+aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "alloc"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

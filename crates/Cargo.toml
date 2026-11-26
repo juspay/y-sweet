@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "y-sweet",
     "y-sweet-core",
+    "xyne-doc-crypto",
 ]
 
 exclude = [

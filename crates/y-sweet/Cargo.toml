@@ -11,6 +11,8 @@ repository = "https://github.com/drifting-in-space/y-sweet"
 anyhow = "1.0.72"
 async-trait = "0.1.71"
 aws-lc-rs = { version = "1", default-features = false, features = ["aws-lc-sys", "alloc"] }
+# Canvas doc encryption (stub in this repository).
+xyne-doc-crypto = { path = "../xyne-doc-crypto" }
 base64 = "0.22"
 aws-config = "1"
 aws-sdk-s3 = "1"

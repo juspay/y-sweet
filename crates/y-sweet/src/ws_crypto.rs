@@ -76,6 +76,11 @@ impl WsGrantKey {
             .map_err(|_| anyhow!("wsKey failed to decrypt"))?;
         serde_json::from_slice(plain).context("wsKey grant is not valid JSON")
     }
+
+    /// The RSA key itself, for opening doc key grants (`xyne_doc_crypto`).
+    pub(crate) fn oaep(&self) -> &OaepPrivateDecryptingKey {
+        &self.0
+    }
 }
 
 /// One direction of one socket: a key, the direction tag and the next counter.

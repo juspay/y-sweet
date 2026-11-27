@@ -1,35 +1,50 @@
+pub mod doc_keys;
 pub mod filesystem;
 pub mod gcs;
 pub mod s3;
 pub mod storage_keys;
 
+use crate::ws_crypto::WsGrantKey;
+use anyhow::Context;
 use gcs::GcsOptions;
 use std::sync::Arc;
 use storage_keys::StorageKeyProvider;
 
 /// Builds GCS store options from the encryption-related settings. Fails if
-/// encryption is requested without the backend URL and server token needed
-/// to fetch keys, so Y-Sweet never starts up writing docs unencrypted.
+/// encryption is requested without the backend URL, server token and grant key
+/// needed to fetch keys, so Y-Sweet never starts up writing docs unencrypted.
+///
+/// Docs are encrypted by Y-Sweet itself with per-doc keys that the backend relays sealed to
+/// `grant_key` (the canvas socket grant private key); CSEK docs stay readable.
 pub fn gcs_options(
     store_encryption: bool,
     backend_url: Option<&str>,
     server_token: Option<&str>,
+    grant_key: Option<&str>,
 ) -> anyhow::Result<GcsOptions> {
-    let key_provider = if store_encryption {
+    if !store_encryption {
+        return Ok(GcsOptions::default());
+    }
+    if !xyne_doc_crypto::AVAILABLE {
+        anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is not supported by this build");
+    }
+    let key_provider = {
         let backend_url = backend_url.filter(|u| !u.is_empty()).ok_or_else(|| {
             anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_BACKEND_URL to be set")
         })?;
         let server_token = server_token.filter(|t| !t.is_empty()).ok_or_else(|| {
             anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_SERVER_TOKEN to be set")
         })?;
-        Some(Arc::new(StorageKeyProvider::new(
-            backend_url,
-            server_token.to_owned(),
-        )?))
-    } else {
-        None
+        Arc::new(StorageKeyProvider::new(backend_url, server_token.to_owned())?)
     };
-    Ok(GcsOptions { key_provider })
+    let raw = grant_key.filter(|k| !k.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_WS_GRANT_PRIVATE_KEY to be set")
+    })?;
+    let grant_key =
+        Arc::new(WsGrantKey::from_base64(raw).context("Invalid Y_SWEET_WS_GRANT_PRIVATE_KEY")?);
+    Ok(GcsOptions {
+        encryption: Some((key_provider, grant_key)),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -156,19 +171,26 @@ mod tests {
     }
 
     #[test]
-    fn encryption_requires_backend_url_and_token() {
-        assert!(gcs_options(true, None, Some("t")).is_err());
-        assert!(gcs_options(true, Some("http://b"), None).is_err());
-        assert!(gcs_options(true, Some(""), Some("t")).is_err());
-        assert!(gcs_options(true, Some("http://b"), Some("")).is_err());
-        let opts = gcs_options(true, Some("http://b"), Some("t")).unwrap();
-        assert!(opts.key_provider.is_some());
+    fn encryption_requires_backend_url_token_and_grant_key() {
+        let (b, t) = (Some("http://b"), Some("t"));
+        let key = Some(crate::ws_crypto::test::private_key());
+        if !xyne_doc_crypto::AVAILABLE {
+            assert!(gcs_options(true, b, t, key).is_err());
+            return;
+        }
+        assert!(gcs_options(true, None, t, key).is_err());
+        assert!(gcs_options(true, b, None, key).is_err());
+        assert!(gcs_options(true, Some(""), t, key).is_err());
+        assert!(gcs_options(true, b, Some(""), key).is_err());
+        assert!(gcs_options(true, b, t, None).is_err());
+        assert!(gcs_options(true, b, t, Some("")).is_err());
+        assert!(gcs_options(true, b, t, Some("not-a-key")).is_err());
+        assert!(gcs_options(true, b, t, key).unwrap().encryption.is_some());
     }
 
     #[test]
     fn encryption_off_needs_no_backend() {
-        let opts = gcs_options(false, None, None).unwrap();
-        assert!(opts.key_provider.is_none());
+        assert!(gcs_options(false, None, None, None).unwrap().encryption.is_none());
     }
 
     #[test]

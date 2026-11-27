@@ -1,18 +1,17 @@
-//! Per-doc customer-supplied encryption keys (CSEK), issued by the backend.
+//! Per-doc storage keys, issued through the backend.
 //!
 //! Y-Sweet never talks to the encryption service directly. It asks the
-//! backend's `POST /internal/ysweet/storage-key` (server-token auth) either to
-//! generate a fresh key for a doc, or to unwrap a key stored in the object's
-//! metadata. Key material must never be logged.
+//! backend's `POST /internal/ysweet/storage-key` (server-token auth) for a
+//! doc's key, which comes back sealed to Y-Sweet's public key (`doc_keys`), so
+//! the backend relaying it cannot read it. Key material must never be logged.
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::Deserialize;
 use std::time::Duration;
 
 const STORAGE_KEY_PATH: &str = "/internal/ysweet/storage-key";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A doc's plaintext CSEK together with its wrapped form (`enc-wdek`).
+/// A doc's key together with its wrapped form (`enc-wdek`).
 #[derive(Clone, PartialEq, Eq)]
 pub struct DocKey {
     pub key: [u8; 32],
@@ -27,14 +26,9 @@ impl std::fmt::Debug for DocKey {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GenerateResponse {
-    key: String,
-    wrapped_key: String,
-}
-
-#[derive(Deserialize)]
-struct UnwrapResponse {
-    key: String,
+struct SealedResponse {
+    wrapped_key: Option<String>,
+    grant: Option<String>,
 }
 
 /// Errors deliberately carry no key material.
@@ -66,29 +60,17 @@ impl StorageKeyProvider {
         })
     }
 
-    /// Asks the backend for a new key for `doc_id`, wrapped under the doc's
-    /// workspace storage key.
-    pub async fn generate(&self, doc_id: &str) -> Result<DocKey, StorageKeyError> {
-        let resp: GenerateResponse = self.post(serde_json::json!({ "docId": doc_id })).await?;
-        if resp.wrapped_key.is_empty() {
-            return Err(StorageKeyError::Malformed("empty wrappedKey"));
-        }
-        Ok(DocKey {
-            key: decode_key(&resp.key)?,
-            wrapped_key: resp.wrapped_key,
-        })
-    }
-
-    /// Asks the backend to unwrap `wrapped_key` (an object's `enc-wdek`).
-    pub async fn unwrap(
-        &self,
-        doc_id: &str,
-        wrapped_key: &str,
-    ) -> Result<[u8; 32], StorageKeyError> {
-        let resp: UnwrapResponse = self
-            .post(serde_json::json!({ "docId": doc_id, "wrappedKey": wrapped_key }))
+    /// `doc_id`'s key, sealed to y-sweet's public key by the encryption service: the backend
+    /// relays it and cannot read it. The backend finds the key from the doc's object (a new key
+    /// for a doc that has none). `(wrapped_key, grant)`.
+    pub async fn sealed(&self, doc_id: &str) -> Result<(String, String), StorageKeyError> {
+        let resp: SealedResponse = self
+            .post(serde_json::json!({ "docId": doc_id }))
             .await?;
-        decode_key(&resp.key)
+        match (resp.wrapped_key, resp.grant) {
+            (Some(w), Some(g)) if !w.is_empty() && !g.is_empty() => Ok((w, g)),
+            _ => Err(StorageKeyError::Malformed("missing wrappedKey or grant")),
+        }
     }
 
     async fn post<T: serde::de::DeserializeOwned>(
@@ -113,41 +95,9 @@ impl StorageKeyProvider {
     }
 }
 
-/// Decodes a base64 key and checks it is exactly 32 bytes (AES-256).
-pub fn decode_key(b64: &str) -> Result<[u8; 32], StorageKeyError> {
-    let bytes = BASE64
-        .decode(b64.trim())
-        .map_err(|_| StorageKeyError::Malformed("key is not valid base64"))?;
-    bytes
-        .try_into()
-        .map_err(|_| StorageKeyError::Malformed("key is not 32 bytes"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn decodes_32_byte_key() {
-        let raw = [7u8; 32];
-        assert_eq!(decode_key(&BASE64.encode(raw)).unwrap(), raw);
-    }
-
-    #[test]
-    fn rejects_wrong_length_key() {
-        assert!(matches!(
-            decode_key(&BASE64.encode([1u8; 16])),
-            Err(StorageKeyError::Malformed(_))
-        ));
-    }
-
-    #[test]
-    fn rejects_invalid_base64() {
-        assert!(matches!(
-            decode_key("not base64!!"),
-            Err(StorageKeyError::Malformed(_))
-        ));
-    }
 
     #[test]
     fn debug_does_not_leak_key() {

@@ -11,54 +11,39 @@ use std::sync::Arc;
 use storage_keys::StorageKeyProvider;
 
 /// Builds GCS store options from the encryption-related settings. Fails if
-/// encryption is requested without the backend URL and server token needed
-/// to fetch keys, so Y-Sweet never starts up writing docs unencrypted.
+/// encryption is requested without the backend URL, server token and grant key
+/// needed to fetch keys, so Y-Sweet never starts up writing docs unencrypted.
 ///
-/// With `local_encryption`, docs are encrypted by Y-Sweet itself with per-doc keys that the
-/// backend relays sealed to `grant_key` (the canvas socket grant private key) instead of with a
-/// CSEK; CSEK docs stay readable.
+/// Docs are encrypted by Y-Sweet itself with per-doc keys that the backend relays sealed to
+/// `grant_key` (the canvas socket grant private key); CSEK docs stay readable.
 pub fn gcs_options(
     store_encryption: bool,
     backend_url: Option<&str>,
     server_token: Option<&str>,
-    local_encryption: bool,
     grant_key: Option<&str>,
 ) -> anyhow::Result<GcsOptions> {
-    if local_encryption && !store_encryption {
-        anyhow::bail!("Y_SWEET_STORE_LOCAL_ENCRYPTION requires Y_SWEET_STORE_ENCRYPTION to be on");
+    if !store_encryption {
+        return Ok(GcsOptions::default());
     }
-    if local_encryption && !xyne_doc_crypto::AVAILABLE {
-        anyhow::bail!("Y_SWEET_STORE_LOCAL_ENCRYPTION is not supported by this build");
+    if !xyne_doc_crypto::AVAILABLE {
+        anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is not supported by this build");
     }
-    let key_provider = if store_encryption {
+    let key_provider = {
         let backend_url = backend_url.filter(|u| !u.is_empty()).ok_or_else(|| {
             anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_BACKEND_URL to be set")
         })?;
         let server_token = server_token.filter(|t| !t.is_empty()).ok_or_else(|| {
             anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_SERVER_TOKEN to be set")
         })?;
-        Some(Arc::new(StorageKeyProvider::new(
-            backend_url,
-            server_token.to_owned(),
-        )?))
-    } else {
-        None
+        Arc::new(StorageKeyProvider::new(backend_url, server_token.to_owned())?)
     };
-    let grant_key = if local_encryption {
-        let raw = grant_key.filter(|k| !k.is_empty()).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Y_SWEET_STORE_LOCAL_ENCRYPTION requires Y_SWEET_WS_GRANT_PRIVATE_KEY to be set"
-            )
-        })?;
-        Some(Arc::new(
-            WsGrantKey::from_base64(raw).context("Invalid Y_SWEET_WS_GRANT_PRIVATE_KEY")?,
-        ))
-    } else {
-        None
-    };
+    let raw = grant_key.filter(|k| !k.is_empty()).ok_or_else(|| {
+        anyhow::anyhow!("Y_SWEET_STORE_ENCRYPTION requires Y_SWEET_WS_GRANT_PRIVATE_KEY to be set")
+    })?;
+    let grant_key =
+        Arc::new(WsGrantKey::from_base64(raw).context("Invalid Y_SWEET_WS_GRANT_PRIVATE_KEY")?);
     Ok(GcsOptions {
-        key_provider,
-        grant_key,
+        encryption: Some((key_provider, grant_key)),
     })
 }
 
@@ -186,40 +171,26 @@ mod tests {
     }
 
     #[test]
-    fn encryption_requires_backend_url_and_token() {
-        assert!(gcs_options(true, None, Some("t"), false, None).is_err());
-        assert!(gcs_options(true, Some("http://b"), None, false, None).is_err());
-        assert!(gcs_options(true, Some(""), Some("t"), false, None).is_err());
-        assert!(gcs_options(true, Some("http://b"), Some(""), false, None).is_err());
-        let opts = gcs_options(true, Some("http://b"), Some("t"), false, None).unwrap();
-        assert!(opts.key_provider.is_some());
-        assert!(opts.grant_key.is_none());
-    }
-
-    #[test]
-    fn local_encryption_needs_store_encryption_and_grant_key() {
+    fn encryption_requires_backend_url_token_and_grant_key() {
         let (b, t) = (Some("http://b"), Some("t"));
         let key = Some(crate::ws_crypto::test::private_key());
         if !xyne_doc_crypto::AVAILABLE {
-            assert!(gcs_options(true, b, t, true, key).is_err());
+            assert!(gcs_options(true, b, t, key).is_err());
             return;
         }
-        assert!(gcs_options(false, b, t, true, key).is_err());
-        assert!(gcs_options(true, b, t, true, None).is_err());
-        assert!(gcs_options(true, b, t, true, Some("")).is_err());
-        assert!(gcs_options(true, b, t, true, Some("not-a-key")).is_err());
-        let opts = gcs_options(true, b, t, true, key).unwrap();
-        assert!(opts.key_provider.is_some());
-        assert!(opts.grant_key.is_some());
-        // The grant key alone (socket encryption) does not turn local encryption on.
-        let socket_only = gcs_options(true, b, t, false, key).unwrap();
-        assert!(socket_only.grant_key.is_none());
+        assert!(gcs_options(true, None, t, key).is_err());
+        assert!(gcs_options(true, b, None, key).is_err());
+        assert!(gcs_options(true, Some(""), t, key).is_err());
+        assert!(gcs_options(true, b, Some(""), key).is_err());
+        assert!(gcs_options(true, b, t, None).is_err());
+        assert!(gcs_options(true, b, t, Some("")).is_err());
+        assert!(gcs_options(true, b, t, Some("not-a-key")).is_err());
+        assert!(gcs_options(true, b, t, key).unwrap().encryption.is_some());
     }
 
     #[test]
     fn encryption_off_needs_no_backend() {
-        let opts = gcs_options(false, None, None, false, None).unwrap();
-        assert!(opts.key_provider.is_none());
+        assert!(gcs_options(false, None, None, None).unwrap().encryption.is_none());
     }
 
     #[test]

@@ -27,16 +27,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Settings for GCS-backed stores.
 #[derive(clap::Args)]
 struct GcsArgs {
-    /// Encrypt each doc with a per-doc customer-supplied key (CSEK) issued by
-    /// the backend. Requires Y_SWEET_BACKEND_URL and Y_SWEET_SERVER_TOKEN.
+    /// Encrypt each doc here (`enc-v: 3`) with a per-doc key the backend relays sealed to
+    /// Y_SWEET_WS_GRANT_PRIVATE_KEY; docs GCS still holds under a CSEK stay readable. Requires
+    /// Y_SWEET_BACKEND_URL, Y_SWEET_SERVER_TOKEN and Y_SWEET_WS_GRANT_PRIVATE_KEY.
     #[clap(long, default_value = "false", env = "Y_SWEET_STORE_ENCRYPTION")]
     store_encryption: bool,
-
-    /// Encrypt docs here (`enc-v: 3`) with per-doc keys the backend relays sealed to
-    /// Y_SWEET_WS_GRANT_PRIVATE_KEY, instead of handing a CSEK to GCS. Requires
-    /// Y_SWEET_STORE_ENCRYPTION and Y_SWEET_WS_GRANT_PRIVATE_KEY.
-    #[clap(long, default_value = "false", env = "Y_SWEET_STORE_LOCAL_ENCRYPTION")]
-    local_encryption: bool,
 }
 
 impl GcsArgs {
@@ -46,13 +41,7 @@ impl GcsArgs {
         server_token: Option<&str>,
         grant_key: Option<&str>,
     ) -> Result<GcsOptions> {
-        gcs_options(
-            self.store_encryption,
-            backend_url,
-            server_token,
-            self.local_encryption,
-            grant_key,
-        )
+        gcs_options(self.store_encryption, backend_url, server_token, grant_key)
     }
 }
 
@@ -260,7 +249,7 @@ fn s3_store_config_from_env(bucket: String, prefix: Option<String>) -> Result<S3
 }
 
 async fn get_store_from_target(target: StoreTarget, gcs: GcsOptions) -> Result<Box<dyn Store>> {
-    if gcs.key_provider.is_some() && !matches!(target, StoreTarget::Gcs { .. }) {
+    if gcs.encryption.is_some() && !matches!(target, StoreTarget::Gcs { .. }) {
         anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is only supported for gs:// stores");
     }
     match target {
@@ -411,7 +400,7 @@ async fn main() -> Result<()> {
                 store.init().await?;
                 Some(store)
             } else {
-                if gcs.key_provider.is_some() {
+                if gcs.encryption.is_some() {
                     anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is set but no store is configured");
                 }
                 tracing::warn!("No store set. Documents will be stored in memory only.");
@@ -561,7 +550,7 @@ async fn main() -> Result<()> {
                 if env::var("STORAGE_PREFIX").is_ok() {
                     anyhow::bail!("If STORAGE_PREFIX is set, STORAGE_BUCKET must also be set.");
                 }
-                if gcs.key_provider.is_some() {
+                if gcs.encryption.is_some() {
                     anyhow::bail!("Y_SWEET_STORE_ENCRYPTION is set but STORAGE_BUCKET is not");
                 }
 

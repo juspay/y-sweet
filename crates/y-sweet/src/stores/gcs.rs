@@ -14,6 +14,8 @@ use y_sweet_core::store::{Result, Store, StoreError};
 /// backend's `SafeStorageService` format.
 const META_ENC_VERSION: &str = "enc-v";
 const META_WRAPPED_KEY: &str = "enc-wdek";
+/// A doc GCS holds under a CSEK, from before Y-Sweet encrypted docs itself; read only.
+#[cfg(test)]
 const ENC_VERSION: &str = "1";
 /// A doc encrypted by Y-Sweet itself with its per-doc key (`doc_keys`); no CSEK.
 const ENC_VERSION_LOCAL: &str = "3";
@@ -22,8 +24,9 @@ const DOC_KEY_SUFFIX: &str = "/data.ysweet";
 
 /// Docs are unloaded by GC without the store being told, so cached keys
 /// expire after this long without a read or write. Active docs touch their
-/// entry on every checkpoint.
-const KEY_CACHE_IDLE: Duration = Duration::from_secs(30 * 60);
+/// entry on every checkpoint. Long enough for a doc left open but idle: the
+/// backend hands out a doc's key only around an open.
+const KEY_CACHE_IDLE: Duration = Duration::from_secs(24 * 60 * 60);
 const KEY_CACHE_MAX_ENTRIES: u64 = 10_000;
 
 fn bucket_resource(bucket: &str) -> String {
@@ -102,17 +105,15 @@ fn encryption_error(op: &str, doc_id: &str, err: impl std::fmt::Display) -> Stor
 
 #[derive(Clone, Default)]
 pub struct GcsOptions {
-    /// When set, every doc is encrypted with a per-doc CSEK.
-    pub key_provider: Option<Arc<StorageKeyProvider>>,
-    /// When set (with `key_provider`), per-doc keys come sealed to this key (the canvas socket
-    /// grant key) and docs are encrypted here (`enc-v: 3`) instead of with a CSEK.
-    pub grant_key: Option<Arc<WsGrantKey>>,
+    /// When set, every doc is encrypted here (`enc-v: 3`) with a per-doc key the backend relays
+    /// sealed to the grant key (the canvas socket grant key).
+    pub encryption: Option<(Arc<StorageKeyProvider>, Arc<WsGrantKey>)>,
 }
 
 struct Encryption {
     provider: Arc<StorageKeyProvider>,
-    /// Encrypt docs here, with keys sealed to this key; `None`: CSEK.
-    local: Option<Arc<WsGrantKey>>,
+    /// Opens the doc keys the backend relays.
+    grant_key: Arc<WsGrantKey>,
     /// `doc_id -> key`. Only holds keys for objects that are (or are about to
     /// be) written encrypted; never for an unencrypted object.
     keys: Cache<String, DocKey>,
@@ -139,10 +140,9 @@ impl GcsStore {
     ) -> anyhow::Result<Self> {
         let storage = Storage::builder().build().await?;
         let control = StorageControl::builder().build().await?;
-        let local = options.grant_key;
-        let encryption = options.key_provider.map(|provider| Encryption {
+        let encryption = options.encryption.map(|(provider, grant_key)| Encryption {
             provider,
-            local,
+            grant_key,
             keys: Cache::builder()
                 .max_capacity(KEY_CACHE_MAX_ENTRIES)
                 .time_to_idle(KEY_CACHE_IDLE)
@@ -250,22 +250,21 @@ impl GcsStore {
         doc_id: &str,
         wrapped_key: &str,
     ) -> Result<DocKey> {
-        let key = match &enc.local {
-            Some(grant_key) => {
-                let grant = enc
-                    .provider
-                    .unwrap_sealed(doc_id, wrapped_key)
-                    .await
-                    .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?;
-                doc_key_from_grant(grant_key, &grant, doc_id, wrapped_key)
-                    .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?
-            }
-            None => enc
-                .provider
-                .unwrap(doc_id, wrapped_key)
-                .await
-                .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?,
-        };
+        let (sealed_wrapped_key, grant) = enc
+            .provider
+            .sealed(doc_id)
+            .await
+            .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?;
+        // The key the backend found must be the one stored beside the doc.
+        if sealed_wrapped_key != wrapped_key {
+            return Err(encryption_error(
+                "unwrap storage key",
+                doc_id,
+                "the backend's key is not the doc's stored key",
+            ));
+        }
+        let key = doc_key_from_grant(&enc.grant_key, &grant, doc_id, wrapped_key)
+            .map_err(|e| encryption_error("unwrap storage key", doc_id, e))?;
         Ok(DocKey {
             key,
             wrapped_key: wrapped_key.to_string(),
@@ -287,23 +286,16 @@ impl GcsStore {
         let existing = self.object_metadata(object_key).await?;
         let doc_key = match existing.as_ref().and_then(wrapped_key_of) {
             Some(wrapped_key) => self.unwrap_key(enc, doc_id, wrapped_key).await?,
-            None => match &enc.local {
-                Some(grant_key) => {
-                    let (wrapped_key, grant) = enc
-                        .provider
-                        .generate_sealed(doc_id)
-                        .await
-                        .map_err(|e| encryption_error("generate storage key", doc_id, e))?;
-                    let key = doc_key_from_grant(grant_key, &grant, doc_id, &wrapped_key)
-                        .map_err(|e| encryption_error("generate storage key", doc_id, e))?;
-                    DocKey { key, wrapped_key }
-                }
-                None => enc
+            None => {
+                let (wrapped_key, grant) = enc
                     .provider
-                    .generate(doc_id)
+                    .sealed(doc_id)
                     .await
-                    .map_err(|e| encryption_error("generate storage key", doc_id, e))?,
-            },
+                    .map_err(|e| encryption_error("generate storage key", doc_id, e))?;
+                let key = doc_key_from_grant(&enc.grant_key, &grant, doc_id, &wrapped_key)
+                    .map_err(|e| encryption_error("generate storage key", doc_id, e))?;
+                DocKey { key, wrapped_key }
+            }
         };
         enc.keys.insert(doc_id.to_string(), doc_key.clone()).await;
         Ok(doc_key)
@@ -371,33 +363,19 @@ impl Store for GcsStore {
                     ))
                 })?;
                 let doc_key = self.key_for_write(enc, doc_id, &object_key).await?;
-                if enc.local.is_some() {
-                    // Encrypted here: GCS stores only ciphertext and never sees the key.
-                    let sealed = seal_doc(&doc_key.key, doc_id, &value)
-                        .map_err(|e| encryption_error("encrypt doc", doc_id, e))?;
-                    self.storage
-                        .write_object(
-                            bucket_resource(&self.bucket),
-                            &object_key,
-                            bytes::Bytes::from(sealed),
-                        )
-                        .set_metadata([
-                            (META_ENC_VERSION, ENC_VERSION_LOCAL.to_string()),
-                            (META_WRAPPED_KEY, doc_key.wrapped_key),
-                        ])
-                } else {
-                    self.storage
-                        .write_object(
-                            bucket_resource(&self.bucket),
-                            &object_key,
-                            bytes::Bytes::from(value),
-                        )
-                        .set_key(aes_key(&doc_key.key)?)
-                        .set_metadata([
-                            (META_ENC_VERSION, ENC_VERSION.to_string()),
-                            (META_WRAPPED_KEY, doc_key.wrapped_key),
-                        ])
-                }
+                // Encrypted here: GCS stores only ciphertext and never sees the key.
+                let sealed = seal_doc(&doc_key.key, doc_id, &value)
+                    .map_err(|e| encryption_error("encrypt doc", doc_id, e))?;
+                self.storage
+                    .write_object(
+                        bucket_resource(&self.bucket),
+                        &object_key,
+                        bytes::Bytes::from(sealed),
+                    )
+                    .set_metadata([
+                        (META_ENC_VERSION, ENC_VERSION_LOCAL.to_string()),
+                        (META_WRAPPED_KEY, doc_key.wrapped_key),
+                    ])
             }
             None => self.storage.write_object(
                 bucket_resource(&self.bucket),

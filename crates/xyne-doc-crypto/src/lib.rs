@@ -1,5 +1,5 @@
-//! Stub of the canvas doc encryption used with `Y_SWEET_STORE_LOCAL_ENCRYPTION`. Nothing encrypts
-//! or decrypts here, and Y-Sweet refuses to start with local encryption on (`AVAILABLE` is `false`).
+//! Stub of the canvas doc encryption used with `Y_SWEET_STORE_ENCRYPTION`. Nothing encrypts or
+//! decrypts here, and Y-Sweet refuses to start with store encryption on (`AVAILABLE` is `false`).
 
 use aws_lc_rs::rsa::OaepPrivateDecryptingKey;
 // Unused here; declared so the dependency set stays fixed in Cargo.lock.
